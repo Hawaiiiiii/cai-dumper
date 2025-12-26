@@ -47,7 +47,6 @@ npm run build
 Quality checks:
 ```powershell
 npm ci
-$env:GH_TOKEN="<your_github_token>"
-npm run build
+$env:GH_TOKEN="<your_github_token>"; npm run build
 ```
 > Provide a GitHub token when running locally so `electron-builder` can reach the GitHub API; CI injects this automatically.

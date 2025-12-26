@@ -3,7 +3,7 @@
 This repository uses a GitFlow-style model tailored for Character.AI Dumper. Branch names and commands below are valid for Windows PowerShell 5.1. A legacy milestone tag `v1.9-stable` exists on `master` even though `package.json` lists `0.1.0-beta`; initialization commands reference that tag intentionally per the migration requirement.
 
 ## Branches
-- `main`: production history. Tags for releases point here. If `master` is the upstream default, keep it but mirror `main` from it.
+- `main`: canonical production history. Tags for releases point here. If `master` is the upstream default, keep `master` only for backward compatibility and keep it in sync by fast-forwarding `master` from `main` until consumers migrate.
 - `develop`: integration branch for completed features.
 - `feature/<slug>`: short-lived branches from `develop`.
 - `release/<version>`: stabilization branches from `develop`.
@@ -53,7 +53,10 @@ git checkout develop
 git pull
 git checkout -b release/<version>
 # update CHANGELOG.md, version info, docs
-git commit -am "chore(release): prepare <version>"
+git add CHANGELOG.md
+git add package.json package-lock.json  # adjust if versioning files differ
+git add docs/                           # adjust if docs live elsewhere
+git commit -m "chore(release): prepare <version>"
 git push -u origin release/<version>
 ```
 
@@ -71,12 +74,13 @@ git push origin v<version>
 
 git checkout develop
 git pull
-git merge --no-ff release/<version> -m "chore(release): <version>"
+git merge --no-ff release/<version> -m "chore(release): merge <version> back to develop"
 git push origin develop
 
 git branch -d release/<version>
 git push origin --delete release/<version>
 ```
+If the branch was already removed remotely, the delete commands will no-op or return a warning; ensure merges completed before deleting.
 
 ### Create a hotfix branch
 ```powershell
@@ -109,7 +113,8 @@ git push origin --delete hotfix/<version>
 
 ### Quality gates before merging
 - `npm ci`
-- `npm run build` (set `$env:GH_TOKEN="<token>"` in PowerShell if required by `electron-builder`)
+- `npm run build`
+  - If `electron-builder` requests GitHub access, set `$env:GH_TOKEN="<token>"` in PowerShell (token is used for GitHub API/release access; see README for scope guidance).
 
 ### Release notes
 - Each release/hotfix PR must include a summary of changes, risks, testing notes, and a pointer to updated `CHANGELOG.md`.

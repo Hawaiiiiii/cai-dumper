@@ -5,7 +5,7 @@
 ## Testing
 
 - [ ] `npm ci`
-- [ ] `$env:GH_TOKEN='<your_github_token>'; npm run build` (only needed locally; CI sets this automatically)
+- [ ] `$env:GH_TOKEN="<your_github_token>"; npm run build` (only needed locally; CI sets this automatically)
 - [ ] Other: 
 
 ## Checklist
