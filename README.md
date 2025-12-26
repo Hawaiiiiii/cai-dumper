@@ -36,3 +36,18 @@ In the app:
 ```powershell
 npm run build
 ```
+
+## Development workflow
+- Branching: `main` (production), `develop` (integration), `feature/<slug>`, `release/<version>`, `hotfix/<version>`.
+- Use conventional commits (e.g., `feat(ui): ...`).
+- Open feature PRs into `develop`; finish releases with merge commits into `main`, tag `vX.Y.Z`, then merge back to `develop`.
+- Update `CHANGELOG.md` for every release/hotfix and include release notes in PRs.
+- See `docs/gitflow.md` for PowerShell-ready commands and branch protection guidance.
+
+Quality checks:
+```powershell
+npm ci
+$env:GH_TOKEN="<your_github_token>"
+npm run build
+```
+> Provide a GitHub token when running locally so `electron-builder` can reach the GitHub API; CI injects this automatically.
