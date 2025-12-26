@@ -1,0 +1,5 @@
+{
+  "name": "CAI Dumper Architect",
+  "description": "A dashboard and reference architecture for the Character.AI chat dumper and analyzer tool. Includes Gemini-powered analysis for exported chat logs.",
+  "requestFramePermissions": []
+}
