@@ -1,0 +1,34 @@
+name: Feature request
+description: Propose an enhancement or new idea
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    attributes:
+      label: Summary
+      description: What should change or be added?
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Use case / motivation
+      description: Why is this valuable? Who benefits?
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Proposed solution
+      description: Outline of the approach or acceptance criteria.
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: Additional context
+      description: Links, screenshots, or related issues.
+    validations:
+      required: false
