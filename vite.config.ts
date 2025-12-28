@@ -4,6 +4,7 @@ import electron from 'vite-plugin-electron/simple'
 import react from '@vitejs/plugin-react'
 
 export default defineConfig({
+  base: './',   // Ensure relative paths for assets
   plugins: [
     react(),
     electron({
