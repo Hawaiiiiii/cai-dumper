@@ -25,6 +25,17 @@ This repository uses a GitFlow-style model tailored for Character.AI Dumper. Bra
   - Require ≥1 approving review.
   - Allow merge commits.
 
+## Scripted workflow (PowerShell / pwsh)
+
+- Bootstrap long-lived branches from the seed tag:  
+  `pwsh -File scripts/gitflow.ps1 -Mode init [-SeedTag v1.9-stable] [-Origin origin] [-DryRun]`
+- Start a release branch using the version from `package.json` (e.g., `release/0.1.0-beta`):  
+  `pwsh -File scripts/gitflow.ps1 -Mode start-release`
+- Finish a release (merge, tag, push, optional GitHub release):  
+  `pwsh -File scripts/gitflow.ps1 -Mode finish-release [-CreateGitHubRelease]`
+
+The script enforces a clean working tree, fetches/prunes remotes, and follows the merge/tag flow below. Override the version with `-Version <x.y.z>` if you need to cut a different release than the one declared in `package.json`.
+
 ## PowerShell command recipes
 
 ### Initialize long-lived branches from `v1.9-stable`

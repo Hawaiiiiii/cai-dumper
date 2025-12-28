@@ -43,6 +43,7 @@ npm run build
 - Open feature PRs into `develop`; finish releases with merge commits into `main`, tag `vX.Y.Z`, then merge back to `develop`.
 - Update `CHANGELOG.md` for every release/hotfix and include release notes in PRs.
 - See `docs/gitflow.md` for PowerShell-ready commands and branch protection guidance.
+- Automation: `pwsh -File scripts/gitflow.ps1 -Mode start-release` bootstraps branches and creates the current release branch from `package.json`.
 
 Quality checks:
 ```powershell
