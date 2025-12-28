@@ -39,6 +39,9 @@
   "build": {
     "appId": "com.cai.dumper",
     "productName": "CAI Dumper",
+    "asarUnpack": [
+      "python/**/*"
+    ],
     "directories": {
       "output": "dist"
     },
