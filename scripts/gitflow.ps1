@@ -4,7 +4,7 @@ param(
     [ValidateSet("init", "start-release", "finish-release")]
     [string]$Mode = "start-release",
     [string]$Version,
-    [string]$SeedTag = "v1.9-stable",
+    [string]$SeedTag = "master",
     [string]$Origin = "origin",
     [switch]$CreateGitHubRelease,
     [switch]$DryRun
@@ -15,7 +15,7 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $repoRoot
 
-$MainBranch = "main"
+$MainBranch = "master"
 $DevelopBranch = "develop"
 $NonWhitespaceControlCharsPattern = "[\x00-\x08\x0B-\x1F]"
 $ValidModesDescription = "init, start-release, finish-release"
