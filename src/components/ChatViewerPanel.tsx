@@ -1,214 +1,182 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Bot, User, FolderOpen, FileText, X } from 'lucide-react';
+
+import React, { useEffect, useRef } from 'react';
+import { Bot, User, FolderOpen, FileText, AlertCircle, Calendar } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
 import { TranscriptMessage } from '../../types';
 
 interface ChatViewerPanelProps {
   messages: TranscriptMessage[];
   characterName: string;
-  reverse: boolean;
+  characterAvatarUrl?: string | null;
+  viewerHandle?: string;
+  viewerAvatarUrl?: string | null;
   search: string;
   loading?: boolean;
   error?: string | null;
   exportDir?: string | null;
   transcriptPath?: string | null;
-  summaryPath?: string | null;
   onOpenFolder?: () => void;
   onOpenTranscript?: () => void;
-  onOpenSummary?: () => void;
 }
 
 const ChatViewerPanel: React.FC<ChatViewerPanelProps> = ({
   messages,
   characterName,
-  reverse,
+  characterAvatarUrl,
+  viewerHandle,
+  viewerAvatarUrl,
   search,
   loading,
   error,
   exportDir,
   transcriptPath,
-  summaryPath,
   onOpenFolder,
   onOpenTranscript,
-  onOpenSummary,
 }) => {
-  const rendered = useMemo(() => {
-    const q = (search || '').trim().toLowerCase();
-    const base = q
-      ? (messages || []).filter((m) => (m.text || '').toLowerCase().includes(q))
-      : (messages || []);
-    return reverse ? [...base].reverse() : base;
-  }, [messages, reverse, search]);
-
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const [height, setHeight] = useState(520);
-  const [scrollTop, setScrollTop] = useState(0);
-  const [expanded, setExpanded] = useState<TranscriptMessage | null>(null);
+  
+  // Filter messages based on search
+  const displayMessages = React.useMemo(() => {
+    const q = search.toLowerCase().trim();
+    if (!q) return messages;
+    return messages.filter(m => m.text.toLowerCase().includes(q));
+  }, [messages, search]);
 
-  const rowHeight = 96;
-  const overscan = 8;
-
+  // Auto-scroll to bottom on load
   useEffect(() => {
-    const el = containerRef.current;
-    if (!el) return;
-    const ro = new ResizeObserver(() => {
-      const h = el.getBoundingClientRect().height;
-      if (h && h > 100) setHeight(Math.floor(h));
-    });
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
+    if (containerRef.current && !search && !loading) {
+      containerRef.current.scrollTop = containerRef.current.scrollHeight;
+    }
+  }, [messages.length, search, loading]);
 
-  const totalHeight = rendered.length * rowHeight;
-  const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
-  const endIndex = Math.min(rendered.length, Math.ceil((scrollTop + height) / rowHeight) + overscan);
-  const visible = rendered.slice(startIndex, endIndex);
-
-  return (
-    <div className="flex-1 min-h-0 bg-gray-950 border border-gray-900 rounded-2xl overflow-hidden flex flex-col">
-      <div className="px-4 py-3 border-b border-gray-900 bg-gray-900/70 backdrop-blur flex items-center justify-between">
-        <div>
-          <div className="text-sm text-gray-400">Chat transcript</div>
-          <div className="text-gray-100 font-semibold">{characterName}</div>
-        </div>
-        <div className="flex items-center gap-2">
-          <div className="text-xs text-gray-500">{rendered.length} messages</div>
-          {exportDir && (
-            <button
-              onClick={onOpenFolder}
-              className="px-2 py-1 rounded border border-gray-800 hover:border-amber-500 text-xs flex items-center gap-1"
-              title="Open export folder"
-            >
-              <FolderOpen size={14} /> Folder
-            </button>
-          )}
-          {transcriptPath && (
-            <button
-              onClick={onOpenTranscript}
-              className="px-2 py-1 rounded border border-gray-800 hover:border-amber-500 text-xs flex items-center gap-1"
-              title="Open transcript.jsonl"
-            >
-              <FileText size={14} /> Transcript
-            </button>
-          )}
-          {summaryPath && (
-            <button
-              onClick={onOpenSummary}
-              className="px-2 py-1 rounded border border-gray-800 hover:border-amber-500 text-xs flex items-center gap-1"
-              title="Open summary.md"
-            >
-              <FileText size={14} /> Summary
-            </button>
-          )}
+  if (loading) {
+    return (
+      <div className="flex-1 flex items-center justify-center bg-[#121214]">
+        <div className="flex flex-col items-center gap-4">
+          <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+          <div className="text-sm text-gray-500">Loading transcript...</div>
         </div>
       </div>
-      <div
-        ref={containerRef}
-        className="flex-1 min-h-0 bg-gradient-to-b from-gray-950 to-gray-900 overflow-y-auto"
-        onScroll={(e) => setScrollTop((e.currentTarget as HTMLDivElement).scrollTop)}
-      >
-        {error && (
-          <div className="p-4 text-sm text-red-300 border-b border-gray-900 bg-red-900/10">{error}</div>
-        )}
-        {loading && (
-          <div className="p-4 text-sm text-gray-400 border-b border-gray-900">Loading transcript…</div>
-        )}
-        {!loading && !error && rendered.length === 0 && (
-          <div className="text-center text-gray-600 mt-8">No transcript loaded yet.</div>
-        )}
-        {rendered.length > 0 && (
-          <div style={{ height: totalHeight, position: 'relative' }}>
-            <div style={{ position: 'absolute', top: startIndex * rowHeight, left: 0, right: 0 }}>
-              {visible.map((msg, i) => (
-                <Row
-                  key={msg.id}
-                  index={startIndex + i}
-                  style={{ height: rowHeight }}
-                  data={{ items: rendered, characterName }}
-                  onExpand={() => setExpanded(msg)}
-                />
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
+    );
+  }
 
-      {expanded && (
-        <div className="absolute inset-0 bg-black/60 flex items-center justify-center p-6">
-          <div className="w-full max-w-3xl bg-gray-950 border border-gray-800 rounded-2xl shadow-2xl overflow-hidden">
-            <div className="px-4 py-3 border-b border-gray-900 bg-gray-900/70 flex items-center justify-between">
-              <div className="text-sm text-gray-200 font-semibold">Full message</div>
-              <button onClick={() => setExpanded(null)} className="text-gray-400 hover:text-gray-200">
-                <X size={18} />
-              </button>
-            </div>
-            <div className="p-4 max-h-[70vh] overflow-y-auto">
-              <div className="text-xs text-gray-500 mb-2">{expanded.sender}{expanded.ts ? ` • ${formatTs(expanded.ts)}` : ''}</div>
-              <div className="whitespace-pre-wrap text-sm text-gray-100 leading-relaxed">{expanded.text}</div>
-            </div>
-            <div className="px-4 py-3 border-t border-gray-900 flex justify-end">
-              <button onClick={() => setExpanded(null)} className="px-3 py-2 rounded-lg border border-gray-800 hover:border-amber-500 text-sm">Close</button>
-            </div>
-          </div>
+  if (error) {
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center p-8 text-center bg-[#121214]">
+        <div className="w-12 h-12 bg-red-900/20 rounded-full flex items-center justify-center mb-4">
+          <AlertCircle size={24} className="text-red-500" />
         </div>
-      )}
-    </div>
-  );
-};
+        <h3 className="text-lg font-medium text-white mb-2">Could not load chat</h3>
+        <p className="text-sm text-gray-400 max-w-md">{error}</p>
+      </div>
+    );
+  }
 
-function formatTs(ts: string | null): string | null {
-  if (!ts) return null;
-  const d = new Date(ts);
-  if (Number.isNaN(d.getTime())) return null;
-  return d.toLocaleString();
-}
+  if (messages.length === 0) {
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center bg-[#121214] text-gray-500">
+        <Bot size={48} className="opacity-10 mb-4" />
+        <p className="text-sm">No messages to display.</p>
+      </div>
+    );
+  }
 
-const Row = ({ index, style, data, onExpand }: any) => {
-  const msg: TranscriptMessage = data.items[index];
-  const characterName = data.characterName;
-  const isViewer = msg.sender === 'viewer';
-  const label = isViewer ? (msg.name || 'You') : (msg.name || characterName);
-  const tsLabel = formatTs(msg.ts);
-  const shouldClamp = msg.text.length > 900 || msg.text.split(/\n/).length > 8;
   return (
-    <div style={style} className="px-4 py-2">
-      <div className={`flex gap-3 ${isViewer ? 'justify-end' : 'justify-start'}`}>
-        {!isViewer && (
-          <div className="w-8 h-8 rounded-full bg-amber-500/20 border border-amber-400/30 flex items-center justify-center text-amber-200 flex-shrink-0">
-            <Bot size={16} />
-          </div>
-        )}
-        <div className={`max-w-[70%] ${isViewer ? 'items-end flex flex-col' : ''}`}>
-          <div className="flex items-center gap-2 mb-1 text-[11px] text-gray-500">
-            <span className={isViewer ? 'text-amber-300' : 'text-gray-300'}>{label}</span>
-            {tsLabel && <span>• {tsLabel}</span>}
-          </div>
-          <div
-            className={`rounded-2xl px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap border ${
-              isViewer
-                ? 'bg-amber-500/15 text-amber-50 border-amber-400/30'
-                : 'bg-gray-900 text-gray-100 border-gray-800'
-            }`}
+    <div className="flex-1 flex flex-col min-h-0 bg-[#121214] relative">
+      {/* Transcript Header Actions (Floating) */}
+      <div className="absolute top-4 right-6 z-10 flex gap-2">
+        {exportDir && (
+          <button 
+            onClick={onOpenFolder} 
+            className="p-2 bg-black/40 backdrop-blur-md border border-white/10 rounded-lg text-gray-400 hover:text-white hover:bg-white/10 transition-all shadow-lg" 
+            title="Open Folder"
           >
-            <div className={shouldClamp ? 'line-clamp-6' : ''}>{msg.text}</div>
-            {shouldClamp && (
-              <button
-                onClick={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  onExpand?.();
-                }}
-                className="mt-2 text-[11px] text-amber-300 hover:text-amber-200 underline"
-              >
-                Expand
-              </button>
-            )}
-          </div>
-        </div>
-        {isViewer && (
-          <div className="w-8 h-8 rounded-full bg-gray-800 border border-amber-400/30 flex items-center justify-center text-amber-200 flex-shrink-0">
-            <User size={16} />
-          </div>
+            <FolderOpen size={16} />
+          </button>
         )}
+        {transcriptPath && (
+          <button 
+            onClick={onOpenTranscript} 
+            className="p-2 bg-black/40 backdrop-blur-md border border-white/10 rounded-lg text-gray-400 hover:text-white hover:bg-white/10 transition-all shadow-lg" 
+            title="View Raw JSONL"
+          >
+            <FileText size={16} />
+          </button>
+        )}
+      </div>
+
+      {/* Messages Area */}
+      <div 
+        ref={containerRef}
+        className="flex-1 overflow-y-auto px-6 py-8 space-y-6 custom-scrollbar"
+      >
+        {/* Intro */}
+        <div className="flex flex-col items-center justify-center py-12 border-b border-white/5 mb-8">
+           <div className="w-20 h-20 rounded-full bg-gradient-to-b from-gray-700 to-gray-800 flex items-center justify-center text-3xl font-bold text-white mb-4 shadow-xl overflow-hidden">
+             {characterAvatarUrl ? (
+                <img src={characterAvatarUrl} alt={characterName} className="w-full h-full object-cover" />
+             ) : (
+                characterName.charAt(0).toUpperCase()
+             )}
+           </div>
+           <h2 className="text-xl font-bold text-white">{characterName}</h2>
+           <p className="text-sm text-gray-500 mt-1 flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-green-500"></span>
+              {messages.length} messages exported
+           </p>
+        </div>
+
+        {displayMessages.map((msg, idx) => {
+          const isUser = msg.sender === 'viewer';
+          // Use explicit handle if available, fallback to "You" for user
+          const senderName = isUser ? (viewerHandle || 'You') : (characterName || 'Character');
+          
+          return (
+            <div key={msg.id || idx} className={`flex gap-4 group ${isUser ? 'justify-end' : 'justify-start'}`}>
+              
+              {!isUser && (
+                <div className="w-8 h-8 rounded-full bg-gray-700 flex-shrink-0 flex items-center justify-center text-gray-300 text-xs font-bold shadow-md mt-1 overflow-hidden">
+                  {characterAvatarUrl ? (
+                    <img src={characterAvatarUrl} alt={characterName} className="w-full h-full object-cover" />
+                  ) : (
+                    characterName.charAt(0).toUpperCase()
+                  )}
+                </div>
+              )}
+              
+              <div className={`flex flex-col max-w-[70%] ${isUser ? 'items-end' : 'items-start'}`}>
+                <div className="text-[11px] text-gray-500 mb-1 px-1 flex items-center gap-2">
+                  <span className="font-medium text-gray-400">{senderName}</span>
+                  {msg.ts && <span className="opacity-50">{new Date(msg.ts).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>}
+                </div>
+                
+                <div 
+                  className={`px-4 py-3 text-[15px] shadow-sm relative group-hover:shadow-md transition-shadow ${
+                    isUser 
+                      ? 'bg-[#195EFF] text-white rounded-2xl rounded-tr-sm' 
+                      : 'bg-[#27272a] text-gray-200 rounded-2xl rounded-tl-sm'
+                  }`}
+                >
+                  <div className={`markdown-body ${isUser ? 'text-white/95' : 'text-gray-200'}`}>
+                    <ReactMarkdown>{msg.text}</ReactMarkdown>
+                  </div>
+                </div>
+              </div>
+
+              {isUser && (
+                 <div className="w-8 h-8 rounded-full bg-blue-900/30 flex-shrink-0 flex items-center justify-center text-blue-200 border border-blue-800/30 text-xs mt-1 overflow-hidden">
+                   {viewerAvatarUrl ? (
+                     <img src={viewerAvatarUrl} alt="You" className="w-full h-full object-cover" />
+                   ) : (
+                     <User size={14} />
+                   )}
+                 </div>
+              )}
+            </div>
+          );
+        })}
+        
+        <div className="h-8"></div> {/* Bottom spacer */}
       </div>
     </div>
   );

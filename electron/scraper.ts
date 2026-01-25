@@ -2,12 +2,20 @@ import { chromium, BrowserContext, Page } from 'playwright';
 import fs from 'fs';
 import path from 'path';
 import { CharacterSummary, CreatorProfile, ViewerProfile, CharacterIndexEntry, ChatIndexEntry, PersonaSummary, VoiceSummary } from '../types';
+import { QAEngine, QAReport, QAContext } from './qa';
 
 export interface ScrapedMessage {
   turn_index: number;
   role: 'user' | 'char';
   text: string;
-  html: string;
+}
+
+export interface ScraperDiagnostics {
+  chosenContainer?: string;
+  chosenMessageSelector?: string;
+  containerResults?: any[];
+  messageCount: number;
+  durationMs: number;
 }
 
 export class ScraperEngine {
@@ -17,12 +25,32 @@ export class ScraperEngine {
   private cacheDir: string;
   private logCallback: (msg: string) => void;
   private verboseSanitizeLogs: boolean;
+  private interceptedMessages: any[] = [];
+  private manualScrollHandler: (() => Promise<boolean>) | null = null;
+  private qaEngine: QAEngine;
 
   constructor(userDataDir: string, logCallback: (msg: string) => void, cacheDir?: string) {
     this.userDataDir = userDataDir;
     this.cacheDir = cacheDir || path.join(userDataDir, 'cache');
     this.logCallback = logCallback;
     this.verboseSanitizeLogs = /^(1|true|yes|on)$/i.test(process.env.CAI_DUMPER_VERBOSE_SANITIZE || '');
+    this.qaEngine = new QAEngine();
+  }
+
+  private buildQAContext(): QAContext {
+    return {
+      page: this.page,
+      interceptedMessagesCount: this.interceptedMessages.length,
+      log: (msg: string) => this.log(msg)
+    };
+  }
+
+  public setManualScrollHandler(handler: () => Promise<boolean>) {
+    this.manualScrollHandler = handler;
+  }
+
+  public isLaunched(): boolean {
+    return this.page !== null;
   }
 
   private log(msg: string) {
@@ -30,89 +58,25 @@ export class ScraperEngine {
     this.logCallback(msg);
   }
 
-  private sanitizeText(
-    raw: unknown,
-    ctx: {
-      field: string;
-      url?: string;
-      maxLen?: number;
-    }
-  ): string | null {
+  private sanitizeText(raw: unknown, ctx: { field: string; url?: string; maxLen?: number }): string | null {
     if (raw === null || raw === undefined) return null;
-    if (typeof raw !== 'string') {
-      if (this.verboseSanitizeLogs) this.log(`[sanitize] drop non-string ${ctx.field} (${typeof raw}) ${ctx.url || ''}`);
-      return null;
-    }
-
-    let s = raw;
-    // Normalize whitespace
-    s = s.replace(/\r\n/g, '\n');
-    s = s.replace(/[\t\f\v]/g, ' ');
-    s = s.replace(/\u00a0/g, ' ');
-    s = s.replace(/\s+/g, ' ').trim();
-
+    if (typeof raw !== 'string') return null;
+    let s = raw.replace(/\r\n/g, '\n').replace(/[\t\f\v]/g, ' ').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
     if (!s) return null;
-
-    // Hard reject common noise we've seen leak in from app shells / toast libraries
-    const lowered = s.toLowerCase();
-    const noiseMarkers = [
-      'toast-container',
-      'toastify',
-      'react-toastify',
-      'css',
-      '{',
-      '}',
-      'style=',
-      '<style',
-      '</style',
-      'animation:',
-      '@keyframes',
-    ];
-    if (noiseMarkers.some((m) => lowered.includes(m))) {
-      if (this.verboseSanitizeLogs) this.log(`[sanitize] drop noisy ${ctx.field}: ${JSON.stringify(s.slice(0, 160))} ${ctx.url || ''}`);
-      return null;
-    }
-
     const maxLen = ctx.maxLen ?? 300;
-    if (s.length > maxLen) {
-      const clipped = s.slice(0, maxLen).trim();
-      if (this.verboseSanitizeLogs) this.log(`[sanitize] clip ${ctx.field} ${s.length}→${clipped.length} ${ctx.url || ''}`);
-      s = clipped;
-    }
-    return s || null;
+    return s.length > maxLen ? s.slice(0, maxLen).trim() : s;
   }
 
   private isValidHandle(handle: string | null | undefined): handle is string {
     if (!handle) return false;
-    return /^@[A-Za-z0-9_]{2,32}$/.test(handle.trim());
+    // Updated regex to allow hyphens and periods, which are valid in c.ai handles
+    return /^@[A-Za-z0-9_.-]{2,64}$/.test(handle.trim());
   }
 
-  private qualityGateText(
-    s: string | null,
-    ctx: { field: string; url?: string; maxLen?: number }
-  ): string | null {
-    if (!s) return null;
-    const lowered = s.toLowerCase();
-    const banned = ['toastify', '@keyframes', ':root', '{', '}'];
-    if (banned.some((b) => lowered.includes(b))) {
-      if (this.verboseSanitizeLogs) this.log(`[quality] drop banned ${ctx.field}: ${JSON.stringify(s.slice(0, 160))} ${ctx.url || ''}`);
-      return null;
-    }
-    // Reject if >30% are "weird" characters (not letter/digit/space/common punctuation)
-    const total = s.length;
-    const okChars = s.match(/[A-Za-z0-9\s.,'"!?@#\-_/():;\[\]\\]/g)?.length ?? 0;
-    const weirdRatio = total > 0 ? (total - okChars) / total : 0;
-    if (weirdRatio > 0.3) {
-      if (this.verboseSanitizeLogs) this.log(`[quality] drop weird-ratio ${ctx.field} ${(weirdRatio * 100).toFixed(1)}% ${ctx.url || ''}`);
-      return null;
-    }
-    const maxLen = ctx.maxLen ?? 300;
-    if (s.length > maxLen) return s.slice(0, maxLen).trim() || null;
-    return s;
-  }
-
-  private safeText(raw: unknown, ctx: { field: string; url?: string; maxLen?: number }): string | null {
-    return this.qualityGateText(this.sanitizeText(raw, ctx), ctx);
+  private normalizeHandle(handle: string | null | undefined): string | null {
+    if (!handle) return null;
+    const h = handle.trim();
+    return h ? (h.startsWith('@') ? h : `@${h}`) : null;
   }
 
   private parseCompactNumber(raw?: string | null): number | null {
@@ -127,1100 +91,1127 @@ export class ScraperEngine {
     return Math.round(base);
   }
 
-  async launch() {
-    this.log("Launching persistent Chromium context...");
+  async launch(cdpEndpoint?: string) {
+    this.log("Initializing browser connection...");
+    
+    if (cdpEndpoint) {
+      // Connect to existing browser session (BrowserView) for network interception
+      this.log(`Connecting to browser at ${cdpEndpoint}...`);
+      try {
+        const browser = await chromium.connectOverCDP(cdpEndpoint);
+        this.browserContext = browser.contexts()[0] || await browser.newContext();
+        const pages = this.browserContext.pages();
+        this.page = pages[0] || await this.browserContext.newPage();
+        this.setupNetworkInterception(this.page);
+        this.log("Connected to existing browser session for interception.");
+        return;
+      } catch (err: any) {
+        this.log(`Failed to connect to existing browser: ${err.message}`);
+        // Fall back to launching dedicated browser
+      }
+    }
+    
+    // Launch dedicated browser instance for scraping
+    this.log("Launching dedicated Chromium instance for scraping...");
     try {
       if (!fs.existsSync(this.userDataDir)) fs.mkdirSync(this.userDataDir, { recursive: true });
       if (!fs.existsSync(this.cacheDir)) fs.mkdirSync(this.cacheDir, { recursive: true });
 
       this.browserContext = await chromium.launchPersistentContext(this.userDataDir, {
-        headless: false,
+        headless: true, // Run headless for scraping
         viewport: null,
         args: [
-          '--start-maximized',
           '--disable-blink-features=AutomationControlled',
           `--disk-cache-dir=${this.cacheDir}`,
           '--disable-gpu-cache',
+          '--no-sandbox',
+          '--disable-dev-shm-usage'
         ],
       });
+      
+      this.page = await this.browserContext.newPage();
+      await this.page.goto('https://character.ai');
+      this.setupNetworkInterception(this.page);
+      this.log("Dedicated scraping browser ready.");
+      
+      return;
     } catch (err: any) {
-      this.log(`Warning: Failed to create cache/user data dir (${err.message}). Continuing without custom cache.`);
-      this.browserContext = await chromium.launchPersistentContext(this.userDataDir, {
-        headless: false,
-        viewport: null,
-        args: ['--start-maximized', '--disable-blink-features=AutomationControlled', '--disable-gpu-cache'],
-      });
+      this.log(`Failed to launch dedicated browser: ${err.message}`);
+      throw err;
     }
-    
-    this.page = await this.browserContext.newPage();
-    await this.page.goto('https://character.ai');
-    this.log("Browser ready. Please log in manually in the opened window.");
   }
 
-  async close() {
-    if (this.browserContext) await this.browserContext.close();
+  private async setupNetworkInterception(page: Page) {
+      this.log("Setting up network interception for c.ai API calls...");
+
+      page.on('response', async (response) => {
+          const url = response.url();
+
+          // Log ONLY important c.ai API calls, not static assets
+          if (url.includes('character.ai') || url.includes('c.ai')) {
+              // Skip static assets and common requests
+              if (url.includes('/_next/static/') ||
+                  url.includes('.woff') ||
+                  url.includes('.css') ||
+                  url.includes('/chunks/') ||
+                  url.includes('/media/') ||
+                  url.includes('/ping') ||
+                  url.includes('/rum?') ||
+                  url.includes('/events.')) {
+                  return;
+              }
+
+              this.log(`[Network] ${response.status()} ${response.request().method()} ${url.replace('https://', '').replace('http://', '')}`);
+          }
+
+          // Intercept Character Details - expanded patterns
+          if (url.includes('/chat/character/') || url.includes('/c.ai/character/') ||
+              url.includes('/api/trpc/character.info') || url.includes('/character/info') ||
+              url.includes('/get_character_info')) {
+              try {
+                  const json = await response.json();
+                  this.log(`[Metadata] Character API response intercepted`);
+                  console.log(`[Metadata] Character data:`, json);
+
+                  // Handle different response structures
+                  const char = json.character || json?.result?.data?.json?.character || json?.data?.character || json;
+                  if (char && (char.name || char.title || char.external_id)) {
+                      this.log(`[Metadata] [OK] Character: ${char.name || char.title || 'Unknown'} | Model: ${char.model_type || 'Default'} | Voice: ${char.voice_id || 'None'}`);
+                  }
+              } catch (e: any) {
+                  const msg = e.message || String(e);
+                  if (msg.includes('No resource with given identifier') || msg.includes('Network.getResponseBody')) {
+                      // Common transient error when request body is collected before we can read it
+                      this.log(`[Metadata] [Warn] Could not retrieve response body (timing issue): ${msg.split('\n')[0]}`);
+                  } else {
+                      this.log(`[Metadata] [FAIL] Failed to parse character response: ${msg}`);
+                  }
+              }
+          }
+
+          // Intercept Chat History
+          if (url.includes('/chat/history/msgs/') || url.includes('/turns/') ||
+              url.includes('/api/trpc/chat.history') || url.includes('/chat/messages') ||
+              url.includes('/chats/recent/')) {
+               try {
+                  const json = await response.json();
+                  this.log(`[Metadata] Chat history API intercepted`);
+
+                  const msgs = json?.messages || json?.turns || json?.result?.data?.json?.messages || json?.data?.messages;
+                  if (msgs && Array.isArray(msgs)) {
+                      this.log(`[Metadata] [OK] Chat messages: ${msgs.length} found`);
+                      this.interceptedMessages.push(...msgs);
+                  }
+               } catch (e) {
+                  this.log(`[Metadata] [FAIL] Failed to parse chat history`);
+               }
+          }
+      });
+  }  async close() {
+    try {
+      if (this.page) await this.page.close().catch(() => {});
+      if (this.browserContext) await this.browserContext.close().catch(() => {});
+    } catch (e: any) {
+      this.log(`Error closing browser: ${(e as Error).message}`);
+    } finally {
+      this.page = null;
+      this.browserContext = null;
+    }
   }
 
-  // Character sidebar scan is DOM-only by design (no backend calls) to respect constraints.
   async scanSidebar(): Promise<CharacterSummary[]> {
     if (!this.page) throw new Error("Browser not launched");
     this.log("Scanning sidebar for chats...");
 
-    // Fallback strategy for Sidebar
-    // Look for links that contain "/chat/"
     try {
-        await this.page.waitForSelector('a[href*="/chat/"]', { timeout: 5000 });
+      await this.page.waitForSelector('a[href*="/chat/"]', { timeout: 5000 });
     } catch (e) {
-        this.log("No chat links found immediately. Please ensure sidebar is open.");
-        return [];
+      this.log("No chat links found immediately. Please ensure sidebar is open.");
+      return [];
     }
 
-    // Scroll sidebar (simple heuristic: find the sidebar container)
-    // This is tricky as CAI structure changes. We try to find the container of the links.
-    // Logic: Find links, find common parent, scroll parent.
+    const seen = new Map<string, CharacterSummary>();
     
-    // For V1 robustness: We just grab what is visible + a bit of scroll. 
-    // Full infinite scroll of sidebar is risky without exact selectors.
-    
-  const seen = new Map<string, CharacterSummary>();
-    
-    for (let i = 0; i < 3; i++) { // Try scrolling a few times
+    // Pass 1-3: Scroll and collect
+    for (let i = 0; i < 3; i++) {
         const elements = await this.page.$$('a[href*="/chat/"]');
-        this.log(`Found ${elements.length} potential chat links (Pass ${i+1})...`);
-        
-  const batch = await this.page.evaluate(() => {
-          const links = Array.from(document.querySelectorAll('a[href*="/chat/"]')) as HTMLAnchorElement[];
-
-          const parseNumber = (val: string | null | undefined): number | null => {
-            if (!val) return null;
-            const cleaned = val.replace(/[,\s]/g, '').toLowerCase();
-            const match = cleaned.match(/([0-9\.]+)(k|m)?/);
-            if (!match) return null;
-            const num = parseFloat(match[1]);
-            if (isNaN(num)) return null;
-            if (match[2] === 'k') return Math.round(num * 1000);
-            if (match[2] === 'm') return Math.round(num * 1_000_000);
-            return Math.round(num);
-          };
-
-          const activityHints = ['today', 'yesterday', 'recent', 'recently', 'minute', 'hour', 'day'];
-
-          const snapshots = links.map((link) => {
-            const href = link.getAttribute('href') || '';
+        const batch = await this.page.evaluate(() => {
+          const links = Array.from(document.querySelectorAll('a[href*="/chat/"]'));
+          return links.map((link) => {
+            const el = link as HTMLElement;
+            const href = el.getAttribute('href') || '';
             const fullUrl = href.startsWith('http') ? href : `https://character.ai${href}`;
             const chatId = fullUrl.split('/').filter(Boolean).pop() || 'unknown';
-
-            const text = link.innerText || '';
+            
+            // Basic info
+            const text = el.innerText || '';
             const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
             const displayName = lines[0] || 'Unknown Character';
-            const preview = lines.find((l, idx) => idx > 0 && l.length > 1) || '';
-
-            const avatarEl = link.querySelector('img');
+            
+            // Handle extraction
+            let creatorHandle: string | null = null;
+            // Look for @handle in the text
+            const handleMatch = text.match(/@([\w\._-]+)/);
+            if (handleMatch) creatorHandle = handleMatch[1];
+            
+            // Avatar
+            const avatarEl = el.querySelector('img');
             const avatarUrl = avatarEl ? (avatarEl.getAttribute('src') || avatarEl.getAttribute('data-src')) : null;
 
-            // Creator inference must be explicit; never guess.
-            // Only accept exact "By @handle" (or standalone @handle) within this card.
-            let creatorHandle: string | null = null;
-            const cardText = link.innerText || '';
-            const byMatch = cardText.match(/\bby\s+(@[A-Za-z0-9_]{2,32})\b/i);
-            if (byMatch) {
-              creatorHandle = byMatch[1];
-            } else {
-              const standalone = lines.find(l => /^@[A-Za-z0-9_]{2,32}$/.test(l));
-              creatorHandle = standalone || null;
+            // Stats Extraction
+            let interactions = '0';
+            let likes = '0';
+
+            // Strategy 1: Look for specific SVGs
+            const svgs = Array.from(el.querySelectorAll('svg'));
+            for (const svg of svgs) {
+                const path = svg.querySelector('path');
+                if (!path) continue;
+                const d = path.getAttribute('d') || '';
+                
+                // Interactions Icon (Play button-ish)
+                // d="M21.5 12c0-5-3.694-8-9.5-8s-9.5 3-9.5 8..."
+                if (d.startsWith('M21.5 12')) {
+                    const container = svg.parentElement; // div.flex.items-center
+                    if (container) {
+                        const textEl = container.querySelector('p') || container;
+                        const rawText = textEl.textContent?.trim() || '';
+                        // Remove commas, keep k/m
+                        // "9,621" -> "9621"
+                        // "9.6k" -> "9.6k"
+                        interactions = rawText.replace(/,/g, '').replace(/ interactions/i, '').trim();
+                    }
+                }
+                
+                // Likes Icon (Thumbs up)
+                // d="M7 11H4a1 1 0 0 0-1 1v7..."
+                if (d.startsWith('M7 11')) {
+                    const container = svg.parentElement;
+                    if (container) {
+                        const textEl = container.querySelector('p') || container;
+                        const rawText = textEl.textContent?.trim() || '';
+                        // "1 like" -> "1"
+                        likes = rawText.replace(/,/g, '').replace(/ likes?/i, '').trim();
+                    }
+                }
             }
 
-            const numbersText = lines.join(' ');
-            const interactionCount = parseNumber(numbersText);
-
-            const lastActivityLabel = lines.find(l => activityHints.some(h => l.toLowerCase().includes(h))) || null;
+            // Strategy 2: Fallback Regex if SVGs didn't work (e.g. layout change)
+            if (interactions === '0' && likes === '0') {
+                 // Look for patterns like "9.6k" or "9,621"
+                 // This is risky as it might pick up other numbers, but better than nothing
+                 const allText = el.innerText;
+                 // Match numbers with optional k/m suffix, allowing commas
+                 // e.g. 100, 1,000, 1.5k, 10m
+                 const matches = allText.match(/(\d+(?:,\d{3})*(?:\.\d+)?[km]?)/gi);
+                 if (matches) {
+                     // Filter out small numbers that might be dates or other things if needed
+                     // But usually stats are the prominent numbers
+                     // Heuristic: Interactions is usually the first large number or number with k/m
+                     if (matches.length > 0) interactions = matches[0].replace(/,/g, '');
+                     if (matches.length > 1) likes = matches[1].replace(/,/g, '');
+                 }
+            }
 
             return {
               characterId: chatId,
               chatId,
               displayName,
-              creator: creatorHandle ? { handle: creatorHandle } : null,
+              handle: creatorHandle || 'Unknown',
               avatarUrl,
-              lastSeenLabel: lastActivityLabel,
-              interactions: interactionCount,
+              interactions,
+              likes,
               url: fullUrl,
-              preview,
-              tagline: preview,
-              updatedAt: new Date().toISOString(),
-            } as CharacterSummary;
+              lastChatDate: 'Recently'
+            };
           });
-
-          // Deduplicate by chatId or url
-          const map = new Map<string, CharacterSummary>();
-          snapshots.forEach((s) => {
-            if (!map.has(s.chatId)) map.set(s.chatId, s);
-          });
-          return Array.from(map.values());
         });
-
-        // Sanitize text-ish fields (done outside evaluate so we can log)
-        for (const snap of batch) {
-          snap.displayName = this.safeText(snap.displayName, { field: 'sidebar.displayName', url: snap.url, maxLen: 120 }) || snap.displayName;
-          snap.preview = this.safeText(snap.preview, { field: 'sidebar.preview', url: snap.url, maxLen: 200 }) || '';
-          snap.tagline = this.safeText(snap.tagline, { field: 'sidebar.tagline', url: snap.url, maxLen: 200 });
-          snap.lastSeenLabel = this.safeText(snap.lastSeenLabel, { field: 'sidebar.lastSeenLabel', url: snap.url, maxLen: 40 });
-
-          if (snap.creator?.handle) {
-            const c = this.safeText(snap.creator.handle, { field: 'sidebar.creator.handle', url: snap.url, maxLen: 40 });
-            if (!c || !this.isValidHandle(c)) {
-              if (this.verboseSanitizeLogs) this.log(`[sidebar] dropping invalid creator handle ${JSON.stringify(snap.creator.handle)} for ${snap.chatId}`);
-              snap.creator = null;
-            } else {
-              snap.creator.handle = c;
-            }
-          }
-        }
 
         for (const snap of batch) {
           if (!seen.has(snap.chatId)) {
-            seen.set(snap.chatId, snap);
+            const cleanDisplayName = this.sanitizeText(snap.displayName, { field: 'sidebar.displayName', maxLen: 120 }) || snap.displayName;
+            
+            const summary: CharacterSummary = {
+                characterId: snap.characterId,
+                chatId: snap.chatId,
+                displayName: cleanDisplayName,
+                avatarUrl: snap.avatarUrl,
+                interactions: snap.interactions,
+                likes: snap.likes,
+                handle: snap.handle,
+                url: snap.url,
+                lastChatDate: snap.lastChatDate,
+                creator: snap.handle ? { handle: snap.handle } : undefined
+            };
+
+            if (summary.creator?.handle && !this.isValidHandle(summary.creator.handle)) {
+                summary.creator = null;
+            }
+            seen.set(snap.chatId, summary);
           }
         }
         
-        // Attempt to scroll the last element into view to trigger lazy load
         if (elements.length > 0) {
-            await elements[elements.length - 1].scrollIntoViewIfNeeded();
-            await this.page.waitForTimeout(1000);
+            await elements[elements.length - 1].scrollIntoViewIfNeeded().catch(() => {});
+            await this.page.waitForTimeout(800);
         }
     }
 
     return Array.from(seen.values());
   }
 
-  async scanSidebarChatsIndex(): Promise<ChatIndexEntry[]> {
-    const chars = await this.scanSidebar();
-    return chars.map((s) => ({
-      chatId: s.chatId,
-      chatUrl: s.url,
-      characterName: s.displayName,
-      avatarUrl: s.avatarUrl || null,
-      lastSeenLabel: s.lastSeenLabel || null,
-      updatedAt: new Date().toISOString(),
-    }));
-  }
-
-  private normalizeHandle(handle: string | null | undefined): string | null {
-    if (!handle) return null;
-    const h = handle.trim();
-    if (!h) return null;
-    return h.startsWith('@') ? h : `@${h}`;
-  }
-
-  async scrapeChatHeader(url: string): Promise<Partial<CharacterSummary>> {
-    if (!this.page) throw new Error('Browser not launched');
-    try {
-      await this.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
-      await this.page.waitForTimeout(1200);
-    } catch (e) {
-      this.log(`Chat header navigation failed: ${(e as Error).message}`);
-    }
-
-    const details = await this.page!.evaluate(() => {
-      const text = (el: Element | null | undefined) => (el?.textContent || '').trim();
-      const parseNumber = (raw?: string | null) => {
-        if (!raw) return null;
-        const cleaned = raw.replace(/[,\s]/g, '').toLowerCase();
-        const m = cleaned.match(/([0-9.]+)(k|m)?/);
-        if (!m) return null;
-        const base = parseFloat(m[1]);
-        if (isNaN(base)) return null;
-        if (m[2] === 'k') return Math.round(base * 1000);
-        if (m[2] === 'm') return Math.round(base * 1_000_000);
-        return Math.round(base);
-      };
-
-      const titleEl = document.querySelector('[data-testid*="title" i], h1, h2');
-      const avatarEl = document.querySelector('img[src*="cdn"], img[alt*="character" i], img[alt*="avatar" i]');
-      const taglineEl = document.querySelector('[data-testid*="tagline" i], [class*="tagline" i], [class*="subtitle" i]');
-      const creatorNode = Array.from(document.querySelectorAll('*')).find(el => /by\s+@/i.test(el.textContent || '')) || document.querySelector('a[href*="/profile/"]');
-      const activityNode = Array.from(document.querySelectorAll('*')).find(el => /(today|yesterday|recent)/i.test(el.textContent || ''));
-
-      let creatorHandle: string | null = null;
-      let creatorDisplay: string | null = null;
-      let creatorProfileUrl: string | null = null;
-      let creatorAvatar: string | null = null;
-
-      if (creatorNode) {
-        const txt = text(creatorNode);
-        const match = txt.match(/@[^\s•]+/);
-        creatorHandle = match ? match[0] : null;
-        creatorDisplay = txt.replace(/by\s+/i, '').trim() || creatorHandle;
-        if ((creatorNode as HTMLAnchorElement).href) {
-          creatorProfileUrl = (creatorNode as HTMLAnchorElement).href;
-        }
-        const img = creatorNode.querySelector('img');
-        if (img) creatorAvatar = img.getAttribute('src') || img.getAttribute('data-src');
+  async scrapeChat(url: string, options?: { reverseTranscript?: boolean; characterName?: string }): Promise<{ messages: ScrapedMessage[], diagnostics: ScraperDiagnostics }> {
+    if (!this.page) throw new Error("Browser not launched");
+    const startTime = Date.now();
+    this.interceptedMessages = []; // Clear previous session data
+    
+    // Resource blocking for stability - Critical for large chats
+    await this.page.route('**/*', route => {
+      const type = route.request().resourceType();
+      if (['image', 'media'].includes(type)) {
+        route.abort().catch(() => {});
+      } else {
+        route.continue().catch(() => {});
       }
-
-      // Avoid scanning the entire body (often includes CSS/toasts); rely on local nodes only.
-      const interactions = (() => {
-        const candidates = [taglineEl, creatorNode, activityNode, titleEl].filter(Boolean) as Element[];
-        const txt = candidates.map(c => c.textContent || '').join(' ');
-        return parseNumber(txt || undefined);
-      })();
-      const chatId = location.pathname.split('/').filter(Boolean).pop() || 'unknown';
-
-      return {
-        displayName: text(titleEl) || null,
-        avatarUrl: avatarEl ? (avatarEl.getAttribute('src') || avatarEl.getAttribute('data-src')) : null,
-        tagline: text(taglineEl) || null,
-        creator: creatorHandle ? {
-          handle: creatorHandle,
-          displayName: creatorDisplay || undefined,
-          avatarUrl: creatorAvatar || undefined,
-          profileUrl: creatorProfileUrl || undefined,
-        } : null,
-        lastSeenLabel: activityNode ? text(activityNode) : null,
-        interactions,
-        chatId,
-        url: location.href,
-      } as Partial<CharacterSummary>;
     });
 
-    details.displayName = this.sanitizeText(details.displayName, { field: 'chatHeader.displayName', url, maxLen: 140 }) || details.displayName;
-    details.tagline = this.sanitizeText(details.tagline, { field: 'chatHeader.tagline', url, maxLen: 220 });
-    details.lastSeenLabel = this.sanitizeText(details.lastSeenLabel, { field: 'chatHeader.lastSeenLabel', url, maxLen: 60 });
-    if (details.creator) {
-      details.creator.handle = this.normalizeHandle(
-        this.sanitizeText(details.creator.handle || '', { field: 'chatHeader.creator.handle', url, maxLen: 80 }) || ''
-      ) || undefined;
-      if (details.creator.displayName) {
-        details.creator.displayName = this.sanitizeText(details.creator.displayName, { field: 'chatHeader.creator.displayName', url, maxLen: 120 }) || details.creator.displayName;
-      }
-      if (details.creator.profileUrl) {
-        details.creator.profileUrl = this.sanitizeText(details.creator.profileUrl, { field: 'chatHeader.creator.profileUrl', url, maxLen: 300 }) || details.creator.profileUrl;
-      }
-    }
-
-    return { ...details, updatedAt: new Date().toISOString() };
-  }
-
-  async hydrateCharacterEntries(entries: CharacterSummary[], options?: { limit?: number }): Promise<CharacterSummary[]> {
-    const limit = options?.limit ?? entries.length;
-    const result: CharacterSummary[] = [];
-    for (let i = 0; i < entries.length; i++) {
-      const entry = entries[i];
-      const needsCreator = !entry.creator?.handle;
-      const needsAvatar = !entry.avatarUrl;
-      const needsTagline = !entry.tagline;
-      if (!needsCreator && !needsAvatar && !needsTagline) {
-        result.push(entry);
-        continue;
-      }
-      if (i >= limit) {
-        result.push(entry);
-        continue;
-      }
-      try {
-        const enriched = await this.scrapeChatHeader(entry.url);
-        result.push({
-          ...entry,
-          displayName: enriched.displayName || entry.displayName,
-          avatarUrl: enriched.avatarUrl || entry.avatarUrl,
-          tagline: enriched.tagline ?? entry.tagline,
-          creator: enriched.creator || entry.creator || null,
-          lastSeenLabel: enriched.lastSeenLabel ?? entry.lastSeenLabel,
-          interactions: enriched.interactions ?? entry.interactions,
-          updatedAt: enriched.updatedAt || new Date().toISOString(),
-        });
-      } catch (e) {
-        this.log(`Chat hydration failed for ${entry.url}: ${(e as Error).message}`);
-        result.push(entry);
-      }
-    }
-    return result;
-  }
-
-  async hydrateChatsMetadata(urls: string[], options?: { limit?: number; signal?: () => boolean }): Promise<Partial<CharacterSummary>[]> {
-    if (!this.page) throw new Error('Browser not launched');
-    const limit = options?.limit ?? urls.length;
-    const results: Partial<CharacterSummary>[] = [];
-    for (let i = 0; i < urls.length; i++) {
-      if (options?.signal && options.signal()) break;
-      if (i >= limit) break;
-      const url = urls[i];
-      try {
-        const enriched = await this.scrapeChatHeader(url);
-        results.push({ ...enriched });
-      } catch (e) {
-        this.log(`Hydrate failed for ${url}: ${(e as Error).message}`);
-      }
-      await this.page.waitForTimeout(300);
-    }
-    return results;
-  }
-
-  async scrapeProfileCharacters(handle: string, sortMode: 'most_chats' | 'alphabetical' | 'most_likes' = 'most_chats'): Promise<CharacterIndexEntry[]> {
-    if (!this.page) throw new Error('Browser not launched');
-    const slug = handle.replace(/^@/, '');
-    const url = `https://character.ai/profile/${encodeURIComponent(slug)}?tab=characters`;
+    this.log(`Navigating to ${url}...`);
     try {
-      await this.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
-      await this.page.waitForTimeout(1000);
-    } catch (e) {
-      this.log(`Profile navigation failed: ${(e as Error).message}`);
-    }
-
-    const entries = await this.page.evaluate((mode) => {
-      const text = (el: Element | null | undefined) => (el?.textContent || '').trim();
-      const parseNumber = (raw?: string | null) => {
-        if (!raw) return null;
-        const cleaned = raw.replace(/[,\s]/g, '').toLowerCase();
-        const m = cleaned.match(/([0-9.]+)(k|m)?/);
-        if (!m) return null;
-        const base = parseFloat(m[1]);
-        if (isNaN(base)) return null;
-        if (m[2] === 'k') return Math.round(base * 1000);
-        if (m[2] === 'm') return Math.round(base * 1_000_000);
-        return Math.round(base);
-      };
-
-      // Optional: click sort dropdown
-      const sortBtn = Array.from(document.querySelectorAll('button, div')).find(el => (el.textContent || '').toLowerCase().includes('sort')) as HTMLButtonElement | undefined;
-      if (sortBtn) sortBtn.click();
-      const modeLabel: Record<string, string> = { most_chats: 'Most Chats', alphabetical: 'Alphabetical', most_likes: 'Most Likes' };
-      const choice = Array.from(document.querySelectorAll('li, button, div')).find(el => (el.textContent || '').toLowerCase().includes((modeLabel[mode] || '').toLowerCase()));
-      if (choice) (choice as HTMLElement).click();
-
-      const cards = Array.from(document.querySelectorAll('[href*="/chat/"]')).filter(a => (a as HTMLAnchorElement).href.includes('/chat/')) as HTMLAnchorElement[];
-      const unique = new Map<string, CharacterIndexEntry>();
-      cards.forEach((a) => {
-        const name = text(a.querySelector('div, span, p')) || 'Unknown';
-        const avatar = a.querySelector('img');
-        const avatarUrl = avatar ? (avatar.getAttribute('src') || avatar.getAttribute('data-src')) : null;
-        const taglineNode = Array.from(a.querySelectorAll('div, span, p')).find(el => (el.textContent || '').length > 30 && (el.textContent || '').length < 180);
-        const interactions = parseNumber(a.textContent || undefined);
-        const chatId = a.href.split('/').filter(Boolean).pop() || null;
-        const entry: CharacterIndexEntry = {
-          characterId: chatId,
-          name,
-          avatarUrl,
-          tagline: taglineNode ? text(taglineNode) : null,
-          interactions,
-          creatorHandle: null,
-          profileUrl: a.href,
-          updatedAt: new Date().toISOString(),
-        };
-        if (!unique.has(a.href)) unique.set(a.href, entry);
-      });
-      return Array.from(unique.values());
-    }, sortMode);
-
-    // sanitize any text we store
-    return entries.map((e) => ({
-      ...e,
-      name: this.sanitizeText(e.name, { field: 'profileCharacters.name', url, maxLen: 120 }) || e.name,
-      tagline: this.sanitizeText(e.tagline, { field: 'profileCharacters.tagline', url, maxLen: 220 }),
-    }));
-  }
-
-  private async scrollListUntilStable(opts: { maxRounds?: number; delayMs?: number; signal?: () => boolean }) {
-    if (!this.page) throw new Error('Browser not launched');
-    const maxRounds = opts.maxRounds ?? 25;
-    const delayMs = opts.delayMs ?? 700;
-
-    let lastCount = 0;
-    let stagnant = 0;
-    for (let round = 0; round < maxRounds; round++) {
-      if (opts.signal && opts.signal()) break;
-
-      const res = await this.page.evaluate(() => {
-        const pickScrollable = (): HTMLElement | null => {
-          const candidates = Array.from(document.querySelectorAll('main *')) as HTMLElement[];
-          const scrollables = candidates.filter(el => el.scrollHeight > el.clientHeight + 40);
-          scrollables.sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
-          return scrollables[0] || null;
-        };
-
-        const container = pickScrollable();
-        const anchorCount = Array.from(document.querySelectorAll('main a[href]')).length;
-        const cardCount = Array.from(document.querySelectorAll('main [role="listitem"], main article, main [data-testid*="card" i]')).length;
-        const before = container ? container.scrollTop : window.scrollY;
-        if (container) {
-          container.scrollTop = container.scrollHeight;
-        } else {
-          window.scrollTo(0, document.body.scrollHeight);
+        await this.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await this.page.waitForTimeout(3000); 
+        
+        // Wait briefly for message DOM nodes to appear. If none show up, we'll
+        // proceed with the scroll-to-top loading sequence which triggers older
+        // messages to be fetched and injected.
+        this.log("Waiting briefly for message nodes to appear in the DOM...");
+        try {
+          await this.page.waitForFunction(() => {
+            return !!document.querySelector('[data-testid="message-row"], .msg-row, [role="row"], .message, [data-message-id]');
+          }, { timeout: 2500 });
+          this.log('[OK] Message nodes detected in DOM');
+        } catch (e) {
+          this.log('No message nodes detected immediately; proceeding with scroll-to-top loading');
         }
-        return { anchorCount, cardCount, before, hasContainer: !!container };
-      });
 
-      const count = Math.max(res.anchorCount, res.cardCount);
-      if (count <= lastCount) stagnant++;
-      else stagnant = 0;
-      lastCount = count;
+        // Skip scroll logic entirely - Character.AI loads all messages via API
+        // Character.AI loads messages by scrolling to the TOP of the chat
+        this.log("Starting scroll-to-top loading sequence...");
 
-      if (stagnant >= 3) break;
-      await this.page.waitForTimeout(delayMs);
-    }
-  }
+        let lastMessageCount = 0;
+        let lastInterceptedCount = 0;
+        let noProgressCount = 0;
+        const maxCycles = 500; // Increased limit for long chats
+        let cycle = 0;
 
-  async indexProfileTab(
-    tab: 'personas' | 'voices',
-    opts?: { maxItems?: number; signal?: () => boolean }
-  ): Promise<PersonaSummary[] | VoiceSummary[]> {
-    if (!this.page) throw new Error('Browser not launched');
-    const viewer = await this.scrapeViewerProfile().catch(() => null);
-    if (!viewer?.handle) throw new Error('Viewer handle unknown; refresh viewer first');
-    const slug = viewer.handle.replace(/^@/, '');
+        // Get initial message count
+        const initialCount = await this.page!.evaluate(() => {
+          const root = document.querySelector('main') || document.body;
+          const selectors = [
+            '[data-testid="message-row"]',
+            '.msg-row',
+            '[role="row"]',
+            '.message',
+            '[data-message-id]',
+            '.chat-message',
+            '.conversation-message',
+            '.turn',
+            '.chat-turn',
+            // Neo UI candidates
+            '[class*="Turn__"]', 
+            '[class*="Message__"]'
+          ];
 
-    // NOTE: The exact tab query can change; we only use GET navigation and DOM scrape.
-    const url = `https://character.ai/profile/${encodeURIComponent(slug)}?tab=${encodeURIComponent(tab)}`;
-    await this.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-    await this.page.waitForTimeout(800);
-
-    await this.scrollListUntilStable({ maxRounds: 30, delayMs: 800, signal: opts?.signal });
-
-    const raw = await this.page.evaluate((tabName) => {
-      const normalizeWs = (s: string) => s.replace(/\r\n/g, '\n').replace(/[\u00a0\t\f\v]/g, ' ').replace(/\s+/g, ' ').trim();
-      const main = document.querySelector('main') || document.body;
-
-      const cards: HTMLElement[] = Array.from(
-        main.querySelectorAll('[role="listitem"], article, [data-testid*="card" i], [class*="card" i]')
-      ) as HTMLElement[];
-
-      const seen = new Set<string>();
-      const entries: any[] = [];
-
-      for (const card of cards) {
-        const text = normalizeWs(card.innerText || card.textContent || '');
-        if (!text) continue;
-
-        const titleEl = (card.querySelector('h3') || card.querySelector('h2') || card.querySelector('h4')) as HTMLElement | null;
-        const title = normalizeWs(titleEl?.textContent || '') || normalizeWs(text.split('\n')[0] || '');
-        if (!title) continue;
-
-        let desc: string | null = null;
-        const lines = (card.innerText || '').split('\n').map(l => normalizeWs(l)).filter(Boolean);
-        if (lines.length > 1) desc = lines.slice(1).join(' • ').slice(0, 240);
-
-        const img = card.querySelector('img') as HTMLImageElement | null;
-        const avatarUrl = img ? (img.getAttribute('src') || img.getAttribute('data-src')) : null;
-
-        // A stable-ish id from title+first 32 chars of description (no crypto API usage)
-        const id = `${tabName}:${title}:${(desc || '').slice(0, 32)}`;
-        if (seen.has(id)) continue;
-        seen.add(id);
-
-        if (tabName === 'voices') {
-          entries.push({ id, displayName: title, description: desc || null });
-        } else {
-          entries.push({ id, displayName: title, description: desc || null, avatarUrl: avatarUrl || null });
-        }
-      }
-
-      return entries;
-    }, tab);
-
-    const maxItems = opts?.maxItems ?? 500;
-    if (tab === 'personas') {
-      const out: PersonaSummary[] = [];
-      for (const e of (raw as any[]).slice(0, maxItems)) {
-        const displayName = this.safeText(e.displayName, { field: 'personas.displayName', url, maxLen: 120 });
-        if (!displayName) continue;
-        out.push({
-          id: String(e.id || `personas:${displayName}`),
-          displayName,
-          description: this.safeText(e.description, { field: 'personas.description', url, maxLen: 240 }),
-          avatarUrl: this.safeText(e.avatarUrl, { field: 'personas.avatarUrl', url, maxLen: 300 }),
+          for (const selector of selectors) {
+            const messages = Array.from(root.querySelectorAll(selector));
+            if (messages.length > 0) {
+              return messages.length;
+            }
+          }
+          return 0;
         });
-      }
-      return out;
+        lastMessageCount = initialCount;
+        this.log(`[Scroll] Initial state: ${lastMessageCount} messages visible`);
+
+        // CRITICAL FIX: Ensure no modals (like Character Profile) are blocking the view
+        // The user often has the profile open, which hijacks the scroll detection
+        try {
+            this.log(`[Scroll] Clearing UI obstructions (Modals/Overlays)...`);
+            // 1. Press Escape to close standard modals
+            await this.page!.keyboard.press('Escape');
+            await this.page!.waitForTimeout(300);
+            await this.page!.keyboard.press('Escape'); // Double tap to be sure
+            await this.page!.waitForTimeout(500);
+
+            // 2. Click the "Msg Input" area to force focus back to the main chat
+            // This ensures we aren't focused on a hidden element or side panel
+            const inputArea = await this.page!.$('textarea, [contenteditable="true"]');
+            if (inputArea) {
+                await inputArea.click({ force: true });
+            } else {
+                // Fallback: Click the left side of the screen (typically safe)
+                await this.page!.mouse.click(100, window.innerHeight / 2);
+            }
+        } catch (e) {
+            this.log(`[Scroll] UI Clear warning: ${e}`);
+        }
+
+        // Try mouse wheel scrolling up to load older messages (more reliable than PageUp)
+        this.log(`[Scroll] Using mouse wheel scrolling to load older messages...`);        // Center mouse for wheel actions
+        try {
+            const viewport = this.page!.viewportSize();
+            if (viewport) {
+                await this.page!.mouse.move(viewport.width / 2, viewport.height * 0.75);
+            }
+        } catch (e) { /* ignore */ }
+        
+        for (let i = 0; i < maxCycles; i++) {
+          // Scroll up using Playwright's mouse wheel (more authentic)
+          await this.page!.mouse.wheel(0, -3000);
+          await this.page!.waitForTimeout(500);
+          
+          // Also try the element specific dispatch as backup
+          await this.page!.evaluate(() => {
+            // Helper to find the best scrollable container (Shared logic)
+            const findScrollable = () => {
+              const canScroll = (el: HTMLElement) => {
+                const maxScroll = el.scrollHeight - el.clientHeight;
+                if (maxScroll <= 0) return false;
+                const prev = el.scrollTop;
+                const next = Math.min(prev + 100, maxScroll);
+                el.scrollTop = next;
+                const changed = el.scrollTop !== prev;
+                el.scrollTop = prev;
+                return changed;
+              };
+
+                // Strategy 1: Center-Point Detection (Most Reliable for "Main Content")
+                // We pick the element in the literal center of the viewport and walk up.
+                const centerEl = document.elementFromPoint(window.innerWidth / 2, window.innerHeight * 0.75);
+                if (centerEl) {
+                    let curr: HTMLElement | null = centerEl as HTMLElement;
+                    while (curr && curr !== document.body) {
+                  if (curr.scrollHeight > curr.clientHeight + 50 && canScroll(curr)) { // +50 tolerance
+                     // @ts-ignore
+                     console.log(`[ContentScript] Found via center-point: ${curr.tagName} (h=${curr.scrollHeight})`);
+                     return curr;
+                        }
+                        curr = curr.parentElement;
+                    }
+                }
+
+                // Strategy 2: Largest Scrollable Area
+                const allElements = document.querySelectorAll('*');
+                // ...existing logic as fallback...
+                const candidates = Array.from(allElements).filter(el => {
+                     if (el.clientHeight < 50) return false;
+                   return el.scrollHeight > el.clientHeight + 100 && canScroll(el as HTMLElement);
+                });
+
+                candidates.sort((a, b) => b.scrollHeight - a.scrollHeight);
+                
+                if (candidates.length > 0) return candidates[0] as HTMLElement;
+
+                // Fallback to body/root
+                return document.scrollingElement as HTMLElement || document.body;
+            };
+
+            const scrollable = findScrollable();
+            // Log the state for debugging
+            // @ts-ignore
+            console.log(`[ContentScript] Found container: h=${scrollable.scrollHeight}, top=${scrollable.scrollTop}`);
+
+            // Dispatch wheel event
+            scrollable.dispatchEvent(new WheelEvent('wheel', {
+              deltaY: -2000, 
+              bubbles: true,
+              cancelable: true
+            }));
+          });
+          
+          // Random jitter to appear more natural and allow variable network latency
+          const waitTime = 2000 + Math.random() * 1000;
+          await this.page!.waitForTimeout(waitTime);          const currentCount = await this.page!.evaluate(() => {
+            const root = document.querySelector('main') || document.body;
+            const selectors = [
+              '[data-testid="message-row"]',
+              '.msg-row',
+              '[role="row"]',
+              '.message',
+              '[data-message-id]',
+              '.chat-message',
+              '.conversation-message',
+              '.turn',
+              '.chat-turn',
+               // Neo UI candidates
+              '[class*="Turn__"]',
+              '[class*="Message__"]'
+            ];
+
+            for (const selector of selectors) {
+              const messages = Array.from(root.querySelectorAll(selector));
+              if (messages.length > 0) {
+                return messages.length;
+              }
+            }
+            return 0;
+          });
+          
+          const currentInterceptedCount = this.interceptedMessages.length;
+          
+          if (currentCount > lastMessageCount || currentInterceptedCount > lastInterceptedCount) {
+            this.log(`[Scroll] [OK] Scroll ${i+1}: DOM ${currentCount} (was ${lastMessageCount}), API ${currentInterceptedCount} (was ${lastInterceptedCount})`);
+            lastMessageCount = currentCount;
+            lastInterceptedCount = currentInterceptedCount;
+            noProgressCount = 0;
+          } else {
+            noProgressCount++;
+            this.log(`[Scroll] Scroll ${i+1}: No progress (${noProgressCount}/5)`);
+          }
+          
+          // Enhanced Fallback Strategy: Direct Scroll Manipulation (No Focus Stealing)
+          if (noProgressCount >= 2) {
+             this.log(`[Scroll] Standard scrolling stalled. Attempting aggressive DOM manipulation...`);
+             try {
+                const result = await this.page!.evaluate(async () => {
+                    // Logic MUST match findScrollable above
+                const canScroll = (el: HTMLElement) => {
+                  const maxScroll = el.scrollHeight - el.clientHeight;
+                  if (maxScroll <= 0) return false;
+                  const prev = el.scrollTop;
+                  const next = Math.min(prev + 100, maxScroll);
+                  el.scrollTop = next;
+                  const changed = el.scrollTop !== prev;
+                  el.scrollTop = prev;
+                  return changed;
+                };
+                    const centerEl = document.elementFromPoint(window.innerWidth / 2, window.innerHeight * 0.75);
+                    let best: HTMLElement | null = null;
+                    
+                    if (centerEl) {
+                        let curr: HTMLElement | null = centerEl as HTMLElement;
+                        while (curr && curr !== document.body) {
+                    if (curr.scrollHeight > curr.clientHeight + 50 && canScroll(curr)) { 
+                      best = curr;
+                      break;
+                            }
+                            curr = curr.parentElement;
+                        }
+                    }
+                    
+                    if (!best) {
+                         const allElements = document.querySelectorAll('*');
+                         const candidates = Array.from(allElements).filter(el => {
+                            if (el.clientHeight < 50) return false;
+                           return el.scrollHeight > el.clientHeight + 100 && canScroll(el as HTMLElement);
+                         });
+                         candidates.sort((a, b) => b.scrollHeight - a.scrollHeight);
+                         if (candidates.length > 0) best = candidates[0] as HTMLElement;
+                    }
+
+                    // Fallback to strict scrollingElement for Neo
+                    if (!best) best = document.scrollingElement as HTMLElement;
+
+                    if (best) {
+                        const info = `${best.tagName.toLowerCase()}.${best.className.split(' ').join('.').substring(0, 50)}... (h=${best.scrollHeight}, t=${best.scrollTop})`;
+                        const startTop = best.scrollTop;
+                        
+                        // Force scroll to top with a "wiggle" to trigger events
+                        
+                        // 1. If we are deep down, scroll up in chunks to simulate reading
+                        // This helps if the observer needs to see items pass by
+                        if (startTop > 2000) {
+                             best.scrollTop = 2000;
+                             await new Promise(r => setTimeout(r, 100));
+                        }
+
+                        // 2. Jump/Move to 50px (near top)
+                        best.scrollTop = 50;
+                        await new Promise(r => setTimeout(r, 150));
+                        
+                        // 3. Smooth scroll to 0 to hit the trigger
+                        best.scrollTo({ top: 0, behavior: 'smooth' });
+                        
+                        // 4. Dispatch scroll event manually
+                        best.dispatchEvent(new Event('scroll', { bubbles: true }));
+                        
+                        return { success: true, info, startTop };
+                    }
+                    return { success: false, info: 'No container found' };
+                });
+
+                if (result && result.success) {
+                    this.log(`[Scroll] Manipulated ${result.info}. Moved from ${result.startTop} to 0.`);
+                    // Give it PLENTY of time to load data
+                    await this.page!.waitForTimeout(3500); 
+                } else {
+                    this.log(`[Scroll] Could not find scrollable container to manipulate.`);
+                }
+             } catch (err) {
+                this.log(`[Scroll] Direct manipulation failed: ${err}`);
+             }
+          }
+
+          if (noProgressCount >= 5) { // Increased tolerance before manual intervention
+            if (this.manualScrollHandler) {
+                this.log(`[Scroll] Automatic scrolling stalled. Requesting manual intervention...`);
+                const shouldContinue = await this.manualScrollHandler();
+                if (shouldContinue) {
+                    this.log(`[Scroll] Resuming after manual intervention...`);
+                    noProgressCount = 0; // Reset counter to give it another chance
+                } else {
+                    this.log(`[Scroll] User requested to stop scrolling.`);
+                    break;
+                }
+            } else {
+                this.log(`[Scroll] Stopping - no progress after ${i+1} scroll attempts`);
+                break;
+            }
+          }
+        }
+
+        // Fallback: try scrolling to the first message element if it exists
+        if (lastMessageCount === initialCount) {
+          this.log(`[Scroll] Mouse wheel didn't work, trying scrollIntoView on first message...`);
+          try {
+            await this.page!.evaluate(() => {
+              const firstMsg = document.querySelector('[data-testid="message-row"], .msg-row, [role="row"]');
+              if (firstMsg) {
+                (firstMsg as HTMLElement).scrollIntoView({ behavior: 'smooth', block: 'start' });
+              }
+            });
+            await this.page!.waitForTimeout(2000);
+            
+            const finalCount = await this.page!.evaluate(() => {
+              const root = document.querySelector('main') || document.body;
+              const selectors = [
+                '[data-testid="message-row"]',
+                '.msg-row',
+                '[role="row"]',
+                '.message',
+                '[data-message-id]',
+                '.chat-message',
+                '.conversation-message',
+                '.turn',
+                '.chat-turn'
+              ];
+
+              for (const selector of selectors) {
+                const messages = Array.from(root.querySelectorAll(selector));
+                if (messages.length > 0) {
+                  return messages.length;
+                }
+              }
+              return 0;
+            });
+            
+            if (finalCount > lastMessageCount) {
+              this.log(`[Scroll] scrollIntoView worked: ${finalCount} messages`);
+              lastMessageCount = finalCount;
+            } else {
+              this.log(`[Scroll] scrollIntoView didn't help`);
+            }
+          } catch (e) {
+            this.log(`[Scroll] scrollIntoView failed: ${e}`);
+          }
+        }
+
+        this.log(`[Scroll] Completed keyboard approach: ${lastMessageCount} total messages, ${this.interceptedMessages.length} API messages`);
+    
+    // If we have very few API messages, offer manual scrolling
+    if (this.interceptedMessages.length < 20) {
+        this.log(`[Scroll] Only ${this.interceptedMessages.length} API messages captured. Offering manual scrolling option...`);
+        
+        // For now, just log that manual scrolling would be offered
+        // In a full implementation, this would show a dialog to the user
+        this.log(`[Manual] To load more messages manually:`);
+        this.log(`[Manual] 1. Use PageUp, Home, or scroll wheel to scroll to the top of the chat`);
+        this.log(`[Manual] 2. Wait for older messages to load`);
+        this.log(`[Manual] 3. The scraper will detect the new API calls automatically`);
+        this.log(`[Manual] Waiting 30 seconds for manual scrolling...`);
+        
+        await this.page!.waitForTimeout(30000); // Give user time to scroll manually
+    }
+    
+    } catch (e: any) {
+        // Retry logic for navigation issues
+        this.log(`Navigation failed, retrying: ${e.message}`);
+        await this.page.reload({ waitUntil: 'domcontentloaded' });
+        await this.page.waitForTimeout(3000);
     }
 
-    const out: VoiceSummary[] = [];
-    for (const e of (raw as any[]).slice(0, maxItems)) {
-      const displayName = this.safeText(e.displayName, { field: 'voices.displayName', url, maxLen: 120 });
-      if (!displayName) continue;
-      out.push({
-        id: String(e.id || `voices:${displayName}`),
-        displayName,
-        description: this.safeText(e.description, { field: 'voices.description', url, maxLen: 240 }),
-      });
+    this.log("Extracting message content...");
+    
+    let result: ScrapedMessage[] = [];
+    let extractionSource = 'dom';
+    let selectorUsed = 'api-interception'; // Default for Path B
+
+    // PATH B: Use Intercepted API Messages if available
+    if (this.interceptedMessages.length > 0) {
+        this.log(`[Extraction] Using ${this.interceptedMessages.length} intercepted API messages as primary source.`);
+        extractionSource = 'api';
+        
+        // Deduplicate raw API messages by ID if available to handle overlaps without killing repeats
+        const seenIds = new Set<string>();
+        const validMsgs: any[] = [];
+        
+        for (const msg of this.interceptedMessages) {
+             // Handle both UUID (old API) and turn_key structure (Neo API)
+             const id = msg.uuid || msg.id || msg.message_id || msg.primary_candidate_id || (msg.turn_key && msg.turn_key.turn_id);
+             
+             if (id) {
+                 if (!seenIds.has(id)) {
+                    seenIds.add(id);
+                    validMsgs.push(msg);
+                 }
+             } else {
+                 validMsgs.push(msg);
+             }
+        }
+
+        // Map API messages to ScrapedMessage
+        const mapped = validMsgs.map((msg, index) => {
+             if (index === 0) {
+                 this.log(`[API Debug] Full structure of first message: ${JSON.stringify(msg, null, 2)}`);
+             }
+
+             let text = msg.text || msg.content || msg.raw_content || '';
+             
+             // Handle "Turn" structure with candidates (Character.AI Neo API)
+             if (!text && msg.candidates && Array.isArray(msg.candidates) && msg.candidates.length > 0) {
+                 // Try to find the primary candidate if specified
+                 let candidate = msg.candidates[0];
+                 if (msg.primary_candidate_id) {
+                     const primary = msg.candidates.find((c: any) => c.candidate_id === msg.primary_candidate_id);
+                     if (primary) candidate = primary;
+                 }
+                 text = candidate.raw_content || candidate.text || candidate.content || '';
+             }
+
+             if (!text) {
+                 // Don't log every failure to avoid spam, just the first few
+                 if (index < 5) this.log(`[API Debug] No text found in message ${index}`);
+                 return null;
+             }
+             
+             let role: 'user' | 'char' = 'char';
+             // Check author in main msg or candidate
+             const author = msg.author || msg.src || (msg.candidates && msg.candidates[0]?.author);
+             
+             if (author) {
+                 if (author.is_human === true || author.is_human === 'true') role = 'user';
+                 else if (author.role === 'USER' || author.role === 'user') role = 'user';
+             }
+             
+             this.log(`[API Debug] Extracted: role=${role}, text length=${text.length}`);
+             return { turn_index: 0, role, text };
+        }).filter(m => m !== null) as ScrapedMessage[];
+
+        // Consecutive deduplication to clean up any rapid-fire duplicate artifacts
+        const unique: ScrapedMessage[] = [];
+        let prevKey: string | null = null;
+        for (const m of mapped) {
+            const key = `${m.role}:${m.text}`;
+            if (key !== prevKey) {
+                unique.push(m);
+                prevKey = key;
+            }
+        }
+        result = unique;
+    } else {
+        // PATH A: DOM Extraction (Fallback)
+        this.log(`[Extraction] No API messages intercepted. Falling back to DOM extraction.`);
+
+        // Extraction: Run in browser, return clean objects. No outerHTML to save memory.
+        const extractionResult = await this.page!.evaluate((charName) => {
+          const root = document.querySelector('main') || document.body;
+
+          const rowSelector = '[data-testid="message-row"], .msg-row, [role="row"], .turn, [class*="Turn__"], [class*="Message__"]';
+          let rows = Array.from(root.querySelectorAll(rowSelector));
+
+          // Fix: Filter out nested elements to avoid duplicates
+          rows = rows.filter(el => {
+             return !rows.some(parent => parent !== el && parent.contains(el));
+          });
+
+          // Fallback: find likely message containers inside main.
+          if (rows.length === 0) {
+            const divs = Array.from(root.querySelectorAll('div'));
+            rows = divs.filter((d) => {
+              const el = d as HTMLElement;
+              const t = (el.innerText || '').trim();
+              if (!t) return false;
+              // Accept shorter messages too (e.g., single emoji or short replies)
+              if (t.length < 1 || t.length > 10000) return false;
+              const r = el.getBoundingClientRect();
+              if (r.height < 16 || r.width < 120) return false;
+              return true;
+            });
+            console.log(`[Extract Debug] Fallback found ${rows.length} potential message containers`);
+          }
+
+          const messages = rows.map((el, idx) => {
+            const rawText = (el as HTMLElement).innerText || '';
+            const lines = rawText.split('\n').map((l: string) => l.trim()).filter(Boolean);
+
+            // Role Detection: More lenient - keep all messages that have content
+            let role: 'user' | 'char' = 'user';
+            const ds = (el as HTMLElement).dataset;
+
+            if (ds.isUser === 'true' || ds.author === 'user') role = 'user';
+            else if (ds.isUser === 'false' || ds.author === 'character') role = 'char';
+            else {
+              // More lenient detection
+              const hasCaiLogo = !!el.querySelector('img[src*="c.ai"], svg[aria-label="Character.AI"]');
+              const hasCaiText = lines.some((l: string) => l.toLowerCase().includes('c.ai'));
+              const startsWithYou = (lines[0] || '').toLowerCase().startsWith('you');
+              const hasUserIndicators = lines.some((l: string) => l.toLowerCase().includes('you') || l.toLowerCase().includes('user'));
+
+              if (hasCaiLogo || hasCaiText) role = 'char';
+              else if (startsWithYou || hasUserIndicators) role = 'user';
+              else role = 'user'; // Default to user if unclear
+            }
+
+            // Clean Body - less aggressive filtering
+            const cleanLines = lines.filter((line: string, i: number) => {
+              if (/^c\.ai$/i.test(line)) return false;
+              // Strip timestamps
+              if (/^(just now|\d+\s+(m|h|d|w|mo|y)|(minute|hour|day|week|month|year)s?\s+ago)$/i.test(line)) return false;
+              // Strip character name header if it matches provided name
+              if (charName && line.toLowerCase() === charName.toLowerCase()) return false;
+              // Only strip 'You'/'User' if it is the header line
+              if (i === 0 && (line === 'You' || line === 'User')) return false;
+              return true;
+            });
+
+            const text = cleanLines.join('\n').trim();
+            // Keep messages that have at least some content, even if short
+            if (text.length < 1) return null; // Minimum 1 character
+
+            const top = (el as HTMLElement).getBoundingClientRect().top;
+
+            return { turn_index: idx, role, text, top };
+          }).filter(m => m && m.text && m.text.length >= 1); // Keep messages with at least 1 character
+
+          return { messages, selectorUsed: rowSelector, count: messages.length };
+        }, options?.characterName);
+
+        this.log(`[Extract Debug] Extraction completed: ${extractionResult.count} messages found`);
+        selectorUsed = extractionResult.selectorUsed;
+        
+        // Deduplicate only consecutive duplicate messages (renderers sometimes produce
+        // duplicated adjacent nodes). Keep non-consecutive duplicates as distinct
+        const deduped: ScrapedMessage[] = [];
+        let prevKey: string | null = null;
+        for (const msg of extractionResult.messages) {
+          if (!msg) continue; // Skip null messages
+          const key = `${msg.role}:${msg.text}`;
+          if (key === prevKey) continue; // drop consecutive duplicate
+          prevKey = key;
+          deduped.push({ turn_index: 0, role: msg.role, text: msg.text }); // Re-index later
+        }
+        result = deduped;
     }
-    return out;
+
+    result = result.map((m, i) => ({ ...m, turn_index: i }));
+    // Auto-detect order: if scraped top-to-bottom, usually chronological.
+    // If reverseTranscript option is explicitly set, honor it.
+    if (options?.reverseTranscript) {
+      result = result.reverse().map((m, i) => ({ ...m, turn_index: i }));
+    }
+
+    this.log(`Extracted ${result.length} clean messages.`);
+    await this.page.unroute('**/*').catch(() => {});
+    
+    return {
+        messages: result,
+        diagnostics: {
+            chosenMessageSelector: selectorUsed,
+            messageCount: result.length,
+            durationMs: Date.now() - startTime
+        }
+    };
   }
 
-  // DOM-only profile scrape (no API calls) to hydrate the logged-in viewer
   async scrapeViewerProfile(): Promise<ViewerProfile | null> {
     if (!this.page) throw new Error("Browser not launched");
-    const page = this.page;
-
-    const debug = (msg: string) => {
-      // Use the existing verbose flag as a lightweight debug-level toggle.
-      if (this.verboseSanitizeLogs) this.log(msg);
-    };
-
-    const strictHandleFromSlug = (slug: string | null | undefined): string | null => {
-      if (!slug) return null;
-      const s = slug.trim().replace(/^@/, '');
-      if (!s) return null;
-      const candidate = `@${s}`;
-      return this.isValidHandle(candidate) ? candidate : null;
-    };
-
-    const slugFromProfileUrl = (u: string | null | undefined): string | null => {
-      if (!u) return null;
-      const m = u.match(/\/profile\/([^/?#]+)/i);
-      return m?.[1] ? decodeURIComponent(m[1]) : null;
-    };
-
-    // Phase 1: go to home, but do not use any global creator/profile links.
-    await page.goto('https://character.ai/', { waitUntil: 'domcontentloaded' }).catch(() => {});
-    await page.waitForTimeout(600);
-
-    // quick login check (best-effort)
-    const loggedIn = await page.evaluate(() => {
-      const loginCues = ['log in', 'sign in', 'login'];
-      const hasLoginCTA = Array.from(document.querySelectorAll('a,button')).some(el => {
-        const txt = (el.textContent || '').toLowerCase();
-        return loginCues.some(c => txt.includes(c));
-      });
-      return !hasLoginCTA;
-    });
-    if (!loggedIn) {
-      this.log('Viewer scrape: appears logged out (login CTA present).');
-      return null;
+    
+    this.log("Navigating to profile page...");
+    await this.page.goto('https://character.ai/profile', { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+    
+    // Wait for key elements to ensure we are on the profile page
+    // We try multiple selectors that might appear
+    try {
+        await Promise.any([
+            this.page.waitForSelector('.text-display', { timeout: 8000 }),
+            this.page.waitForSelector('div[class*="text-display"]', { timeout: 8000 }),
+            this.page.waitForSelector('button', { timeout: 8000 }) // At least some buttons should appear
+        ]);
+        // Give a small buffer for React to hydrate fully
+        await this.page!.waitForTimeout(1000);
+    } catch (e: any) {
+        this.log("Warning: Timeout waiting for profile selectors. Attempting scrape anyway...");
     }
 
-    // Try to discover viewer profile URL from *top navigation area only* (avoid matching creator links in content).
-    const navProfileHref = await page.evaluate(() => {
-      const candidates = [
-        document.querySelector('header') as HTMLElement | null,
-        document.querySelector('nav') as HTMLElement | null,
-        document.querySelector('[role="banner"]') as HTMLElement | null,
-      ].filter(Boolean) as HTMLElement[];
+    const profile = await this.page!.evaluate(() => {
+        // Helper to find text content safely
+        const getText = (selector: string) => {
+            const el = document.querySelector(selector);
+            return (el as HTMLElement)?.innerText?.trim() || null;
+        };
 
-      const root = candidates[0] || document.body;
-      const anchors = Array.from(root.querySelectorAll('a[href]')) as HTMLAnchorElement[];
-      const profileAnchor = anchors.find(a => {
-        const href = a.getAttribute('href') || '';
-        return /\/(profile|user)\//i.test(href);
-      });
+        // 1. Name & Handle
+        // Try specific class first, then fallback to searching by structure
+        let displayName = getText('.text-display') || getText('div[class*="text-display"]');
+        
+        // Fallback: Look for the largest text element in the main container
+        if (!displayName) {
+             const candidates = Array.from(document.querySelectorAll('div, h1, h2, span'))
+                .filter(el => {
+                    const style = window.getComputedStyle(el);
+                    return parseFloat(style.fontSize) > 20; // Heuristic for name
+                });
+             if (candidates.length > 0) displayName = (candidates[0] as HTMLElement).innerText?.trim() || null;
+        }
 
-      const href = profileAnchor?.getAttribute('href') || null;
-      if (!href) return null;
-      return href.startsWith('http') ? href : `https://character.ai${href}`;
-    });
+        // Handle
+        // Look for @ symbol in muted text
+        const allMuted = Array.from(document.querySelectorAll('.text-muted-foreground, [class*="text-muted"]'));
+        const handleEl = allMuted.find(el => (el as HTMLElement).innerText?.trim().startsWith('@'));
+        const handle = (handleEl as HTMLElement)?.innerText?.trim() || null;
 
-    const handleFromNavHref = strictHandleFromSlug(slugFromProfileUrl(navProfileHref));
-    if (handleFromNavHref) debug(`[viewer] handle candidate from nav href: ${handleFromNavHref}`);
+        // 2. Avatar
+        // Find 90x90 image or largest image in main
+        const imgs = Array.from(document.querySelectorAll('main img, img[alt*="Avatar"]'));
+        const avatarEl = imgs.find(img => {
+            const rect = img.getBoundingClientRect();
+            // User HTML has 90x90. We allow some variance.
+            return rect.width >= 80 && rect.height >= 80; 
+        });
+        const avatarUrl = avatarEl?.getAttribute('src') || null;
 
-    // Navigate to profile page if we found it.
-    if (navProfileHref) {
-      await page.goto(navProfileHref, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-      await page.waitForTimeout(700);
-    }
+        // 3. c.ai+ Badge
+        const isPlus = !!document.querySelector('.cai-plus-gradient');
 
-    // Phase 1 (core): profile page header-scoped scrape
-    const scraped = await page.evaluate(() => {
-      const normalizeWs = (s: string) => s.replace(/\r\n/g, '\n').replace(/[\u00a0\t\f\v]/g, ' ').replace(/\s+/g, ' ').trim();
-      const header =
-        (document.querySelector('main header') as HTMLElement | null)
-        || (document.querySelector('[class*="profile" i][class*="header" i]') as HTMLElement | null)
-        || (document.querySelector('header') as HTMLElement | null)
-        || (document.querySelector('main') as HTMLElement | null)
-        || document.body;
+        // 4. Stats
+        // Search buttons for keywords
+        const buttons = Array.from(document.querySelectorAll('button'));
+        const followersBtn = buttons.find(b => b.innerText?.toLowerCase().includes('followers'));
+        const followingBtn = buttons.find(b => b.innerText?.toLowerCase().includes('following'));
+        
+        // Interactions often in p tag or div
+        // We must ensure we don't grab a parent container.
+        // We look for an element whose OWN text is roughly "X Interactions"
+        const allElements = Array.from(document.querySelectorAll('p, span, div'));
+        const interactionsEl = allElements.find(el => {
+            const t = (el as HTMLElement).innerText?.trim() || '';
+            // Must contain "Interactions"
+            if (!t.toLowerCase().includes('interactions')) return false;
+            // Must be short (e.g. "24.9k Interactions") - prevent grabbing parents
+            if (t.length > 30) return false; 
+            // Ensure it doesn't contain newlines which usually implies multiple children
+            if (t.includes('\n')) return false;
+            return true;
+        });
 
-      const headerText = normalizeWs(header.innerText || header.textContent || '');
+        const parseStat = (text: string | undefined, keyword: string) => {
+            if (!text) return '0';
+            // Case insensitive replace
+            const regex = new RegExp(keyword, 'gi');
+            return text.replace(regex, '').replace(/[|•]/g, '').trim();
+        };
 
-      const handleMatch = headerText.match(/@[A-Za-z0-9_]{2,32}/);
-      const handleFromHeader = handleMatch ? handleMatch[0] : null;
-
-      // Also try to find a profile link in the header/banner area.
-      const anchors = Array.from(header.querySelectorAll('a[href]')) as HTMLAnchorElement[];
-      const profileHref = anchors.find(a => /\/profile\//i.test(a.getAttribute('href') || ''))?.getAttribute('href') || null;
-      const profileUrl = profileHref ? (profileHref.startsWith('http') ? profileHref : `https://character.ai${profileHref}`) : null;
-
-      // Best-effort display name: prefer h1/h2 within header
-      const titleEl = (header.querySelector('h1') || header.querySelector('h2')) as HTMLElement | null;
-      let displayName = titleEl ? normalizeWs(titleEl.textContent || '') : null;
-      if (!displayName) {
-        // fallback: first non-handle-ish line
-        const lines = (header.innerText || '').split('\n').map(l => normalizeWs(l)).filter(Boolean);
-        const firstGood = lines.find(l => !/^@[A-Za-z0-9_]{2,32}$/.test(l) && l.length > 1) || null;
-        displayName = firstGood;
-      }
-
-      // Avatar: pick first image inside header with a src.
-      const imgs = Array.from(header.querySelectorAll('img')) as HTMLImageElement[];
-      const avatarEl = imgs.find(img => {
-        const src = img.getAttribute('src') || img.getAttribute('data-src') || '';
-        if (!src) return false;
-        const w = (img as any).naturalWidth || img.width || 0;
-        const h = (img as any).naturalHeight || img.height || 0;
-        // Don't require size, but prefer non-tiny
-        return w === 0 || h === 0 ? true : (w >= 32 && h >= 32);
-      }) || null;
-      const avatar = avatarEl ? (avatarEl.getAttribute('src') || avatarEl.getAttribute('data-src')) : null;
-
-      // Stats: parse from header text only (no global scanning)
-      const parseCompact = (label: string): number | null => {
-        const re = new RegExp(`([0-9.,]+\\s*[kKmM]?)\\s*${label}`, 'i');
-        const m = headerText.match(re);
-        return m ? m[1].trim() as any : null;
-      };
-
-      return {
-        headerText,
-        handleFromHeader,
-        displayName,
-        avatar,
-        followersText: parseCompact('followers?'),
-        followingText: parseCompact('following'),
-        interactionsText: parseCompact('interactions?'),
-        profileUrl,
-        url: location.href,
-      };
+        return {
+            displayName: displayName || 'User',
+            handle: handle,
+            avatarUrl: avatarUrl,
+            isPlus: isPlus,
+            followers: parseStat(followersBtn?.innerText, 'Followers'),
+            following: parseStat(followingBtn?.innerText, 'Following'),
+            interactions: parseStat((interactionsEl as HTMLElement)?.innerText, 'Interactions')
+        };
     });
 
-    // Handle extraction precedence (STRICT):
-    // 1) canonical slug from current URL if on /profile/<slug>
-    // 2) slug from header/profile link href
-    // 3) slug from nav/header discovered profile href
-    // 4) explicit @handle text in header
-    // NEVER derive from displayName.
-    const handleFromCurrentUrl = strictHandleFromSlug(page.url().match(/\/profile\/([^/?#]+)/i)?.[1] || null);
-    const handleFromHeaderHref = strictHandleFromSlug(slugFromProfileUrl((scraped as any).profileUrl || null));
-    const handleFromHeaderText = this.isValidHandle(scraped.handleFromHeader || '') ? (scraped.handleFromHeader as string) : null;
+    this.log(`Scraped Profile: ${JSON.stringify(profile)}`);
 
-    const handleCandidate = handleFromCurrentUrl || handleFromHeaderHref || handleFromNavHref || handleFromHeaderText;
-    if (!handleCandidate) {
-      debug(`[viewer] handle rejected. candidates: url=${handleFromCurrentUrl || 'null'} headerHref=${handleFromHeaderHref || 'null'} navHref=${handleFromNavHref || 'null'} headerText=${handleFromHeaderText || 'null'}`);
-    } else {
-      debug(`[viewer] handle chosen: ${handleCandidate} (url=${handleFromCurrentUrl ? 'Y' : 'N'}, headerHref=${handleFromHeaderHref ? 'Y' : 'N'}, navHref=${handleFromNavHref ? 'Y' : 'N'}, headerText=${handleFromHeaderText ? 'Y' : 'N'})`);
+    // Fallback for handle if not found in DOM
+    if (!profile.handle) {
+        const bodyText = await this.page.evaluate(() => document.body.innerText);
+        const match = bodyText.match(/@[A-Za-z0-9_]+/);
+        if (match) profile.handle = match[0];
     }
 
-    const handle = handleCandidate && this.isValidHandle(handleCandidate) ? handleCandidate : null;
+    if (!profile.handle || !this.isValidHandle(profile.handle)) return null;
 
-    if (!handle) {
-      this.log('Viewer scrape failed: could not extract a valid @handle from profile header/url');
-      return null;
-    }
-
-    const displayName = this.safeText(scraped.displayName, { field: 'viewer.displayName', url: scraped.url, maxLen: 120 });
-    const avatarUrl = this.safeText(scraped.avatar, { field: 'viewer.avatarUrl', url: scraped.url, maxLen: 300 });
-
-    const followers = this.parseCompactNumber(this.safeText(scraped.followersText, { field: 'viewer.followers', url: scraped.url, maxLen: 30 }));
-    const following = this.parseCompactNumber(this.safeText(scraped.followingText, { field: 'viewer.following', url: scraped.url, maxLen: 30 }));
-    const interactions = this.parseCompactNumber(this.safeText(scraped.interactionsText, { field: 'viewer.interactions', url: scraped.url, maxLen: 30 }));
-
-    if (!displayName) {
-      this.log('Viewer scrape failed: missing displayName in profile header');
-      return null;
-    }
-
-    const viewer: ViewerProfile = {
-      handle,
-      displayName,
-      avatarUrl: avatarUrl || null,
-      followers: followers ?? null,
-      following: following ?? null,
-      interactions: interactions ?? null,
-      profileUrl: scraped.url || page.url(),
-      updatedAt: new Date().toISOString(),
-      source: 'dom',
+    return {
+        handle: profile.handle,
+        displayName: profile.displayName,
+        avatarUrl: profile.avatarUrl,
+        isPlus: profile.isPlus,
+        updatedAt: new Date().toISOString(),
+        source: 'dom',
+        followers: profile.followers,
+        following: profile.following,
+        interactions: profile.interactions
     };
-
-    return viewer;
-  }
-
-  async getUserProfile(): Promise<ViewerProfile | null> {
-    return this.scrapeViewerProfile();
   }
 
   async getCreatorProfile(username: string): Promise<CreatorProfile | null> {
     if (!this.browserContext) throw new Error("Browser not launched");
     const page = await this.browserContext.newPage();
     try {
-      await page.goto(`https://character.ai/profile/${encodeURIComponent(username)}`, { waitUntil: 'domcontentloaded', timeout: 15000 });
-      await page.waitForTimeout(500);
-      const profile = await page.evaluate(() => {
-        const textContent = (el: Element | null | undefined) => (el?.textContent || '').trim();
-        const avatarEl = document.querySelector('img[src*="cdn"], img[alt*="avatar" i]');
-        const usernameEl = document.querySelector('[data-testid*="username" i], [class*="username" i], h1, h2');
-        const username = textContent(usernameEl) || null;
-
-        const numberFromLabel = (label: string) => {
-          const el = Array.from(document.querySelectorAll('*')).find(e => (e.textContent || '').toLowerCase().includes(label));
-          if (!el) return null;
-          const numText = (el.textContent || '').match(/([0-9,.kK]+)\s*/);
-          if (!numText) return null;
-          const cleaned = numText[1].replace(/[,\s]/g, '').toLowerCase();
-          const m = cleaned.match(/([0-9.]+)(k|m)?/);
-          if (!m) return null;
-          const base = parseFloat(m[1]);
-          if (isNaN(base)) return null;
-          if (m[2] === 'k') return Math.round(base * 1000);
-          if (m[2] === 'm') return Math.round(base * 1_000_000);
-          return Math.round(base);
-        };
-
-        const followers = numberFromLabel('follower');
-        const following = numberFromLabel('following');
-        const interactions = numberFromLabel('interaction') || numberFromLabel('message');
-
-        if (!username) return null;
+        await page.goto(`https://character.ai/profile/${username}`, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        const data = await page.evaluate(() => {
+            const h1 = document.querySelector('h1');
+            const img = document.querySelector('img[alt*="avatar"]');
+            return {
+                username: (h1 as HTMLElement)?.innerText || null,
+                avatarUrl: img?.getAttribute('src') || null
+            }
+        });
+        if (!data.username) return null;
         return {
-          username: username.replace(/^@/, ''),
-          avatarUrl: avatarEl ? (avatarEl.getAttribute('src') || avatarEl.getAttribute('data-src')) : null,
-          followers: followers ?? null,
-          following: following ?? null,
-          interactions: interactions ?? null,
-          fetchedAt: new Date().toISOString(),
-        } as CreatorProfile;
-      });
-      if (!profile) return null;
-      // sanitize minimal fields (username is used as a slug)
-      const safeUsername = this.sanitizeText(profile.username, { field: 'creatorProfile.username', url: `https://character.ai/profile/${encodeURIComponent(username)}`, maxLen: 80 });
-      return {
-        ...profile,
-        username: (safeUsername || profile.username).replace(/^@/, ''),
-      };
-    } catch (e) {
-      this.log(`Creator profile fetch failed for ${username}: ${(e as Error).message}`);
-      return null;
+            username: username,
+            avatarUrl: data.avatarUrl,
+            fetchedAt: new Date().toISOString(),
+            followers: 0, following: 0, interactions: 0
+        };
+    } catch {
+        return null;
     } finally {
-      await page.close().catch(() => {});
+        await page.close().catch(()=>{});
     }
   }
 
-  async scrapeChat(url: string, options?: { reverseTranscript?: boolean }): Promise<ScrapedMessage[]> {
-    if (!this.page) throw new Error("Browser not launched");
-    this.log(`Navigating to ${url}...`);
-    await this.page.goto(url);
-    await this.page.waitForTimeout(3000); // Wait for app hydration
-
-    this.log("Starting scroll-to-top sequence (fingerprint-based)...");
-
-    const seenFingerprints = new Set<string>();
-    let stagnantCycles = 0;
-    let cycle = 0;
-    const maxCycles = 200; // safety cap
-
-    // Temporary network logger for pagination signals
-    let cycleNetworkHit = false;
-    const responseHandler = (resp: any) => {
-      const url = resp.url();
-      if (/graphql|conversation|message/i.test(url)) {
-        this.log(`[net] ${resp.status()} ${url}`);
-        cycleNetworkHit = true;
-      }
-    };
-    this.page.on('response', responseHandler);
-
-    while (stagnantCycles < 5 && cycle < maxCycles) {
-      cycleNetworkHit = false;
-
-      // Focus main chat container and trigger pagination keys
-      try {
-        await this.page.click('main', { timeout: 1000 });
-      } catch (e) {
-        // best-effort
-      }
-      for (let i = 0; i < 3; i++) {
-        await this.page.keyboard.press('PageUp');
-        await this.page.waitForTimeout(200);
-      }
-
-      // Scroll bounce: top then a small down to poke virtualization
-      await this.page.evaluate(() => {
-        const scrollable = Array.from(document.querySelectorAll('div')).find(d => d.scrollHeight > d.clientHeight + 20);
-        if (scrollable) {
-          (scrollable as HTMLElement).scrollTop = 0;
-          (scrollable as HTMLElement).scrollTop = 40;
-        } else {
-          window.scrollTo(0, 0);
-          window.scrollTo(0, 40);
-        }
-      });
-
-      // Gather message fingerprints using the same container/message heuristics as extraction
-      const fingerprints = await this.page.evaluate(() => {
-        const containerCandidates = [
-          { name: 'main-role-log', selector: 'main [role="log"]', priority: 3 },
-          { name: 'main-role-feed', selector: 'main [role="feed"]', priority: 3 },
-          { name: 'main-aria-message', selector: 'main [aria-label*="message" i]', priority: 2 },
-          { name: 'main', selector: 'main', priority: 1 },
-        ];
-        const messageSelectors = [
-          { name: 'article', selector: 'article' },
-          { name: 'role-article', selector: '[role="article"]' },
-          { name: 'role-listitem', selector: '[role="listitem"]' },
-          { name: 'div-has-more', selector: 'div:has(button[aria-label*="more" i])' },
-        ];
-
-        const cleanText = (text: string) => {
-          const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-          const junk = /^(Copy|Report|Share|Like|Reply|Menu|More)$/i;
-          const kept = lines.filter(l => !junk.test(l) && l.length > 1);
-          return kept.join('\n').trim();
-        };
-
-        const containerResults = containerCandidates.map(c => {
-          const root = document.querySelector(c.selector);
-          const messageCounts = messageSelectors.map(ms => {
-            const nodes = root ? Array.from(root.querySelectorAll(ms.selector)) : [];
-            return { selector: ms.selector, name: ms.name, count: nodes.length };
-          });
-          const total = messageCounts.reduce((sum, m) => sum + m.count, 0);
-          return { container: c.selector, containerName: c.name, priority: c.priority, total };
-        });
-
-        const bestContainer = containerResults
-          .filter(r => r.total > 0)
-          .sort((a, b) => b.priority - a.priority || b.total - a.total)[0] || containerResults[0];
-
-        const root = bestContainer?.container ? document.querySelector(bestContainer.container) : document;
-        const bestMessageSelector = messageSelectors
-          .map(ms => ({
-            selector: ms.selector,
-            name: ms.name,
-            nodes: root ? Array.from(root.querySelectorAll(ms.selector)) : [],
-          }))
-          .sort((a, b) => b.nodes.length - a.nodes.length)[0];
-
-        const nodes = bestMessageSelector ? bestMessageSelector.nodes : [];
-
-        const inferRole = (el: Element): 'user' | 'char' => {
-          const dataset = (el as HTMLElement).dataset;
-          if (dataset['isUser'] === 'true' || dataset['author'] === 'user') return 'user';
-          const text = el.textContent || '';
-          if (/\bYou\b/i.test(text)) return 'user';
-          const style = window.getComputedStyle(el as HTMLElement);
-          if (style.textAlign === 'right') return 'user';
-          if (style.justifyContent?.includes('flex-end')) return 'user';
-          return 'char';
-        };
-
-        const fps = nodes.map(el => {
-          const text = cleanText((el as HTMLElement).innerText).slice(0, 200);
-          const role = inferRole(el);
-          return `${role}::${text}`;
-        }).filter(Boolean);
-
-        return fps;
-      });
-
-      let newThisCycle = 0;
-      for (const fp of fingerprints) {
-        if (!seenFingerprints.has(fp)) {
-          seenFingerprints.add(fp);
-          newThisCycle++;
-        }
-      }
-
-      if (newThisCycle === 0) {
-        if (cycleNetworkHit) {
-          stagnantCycles = 0; // consider pagination attempt successful due to network activity
-        } else {
-          stagnantCycles++;
-        }
-      } else {
-        stagnantCycles = 0;
-      }
-
-      this.log(`Scroll cycle ${cycle + 1}: totalSeen=${seenFingerprints.size}, newThisCycle=${newThisCycle}, netHit=${cycleNetworkHit}, stagnantCycles=${stagnantCycles}`);
-
-      if (stagnantCycles >= 5) break;
-
-      // Scroll to top and wait
-      await this.page.evaluate(() => {
-        const scrollable = Array.from(document.querySelectorAll('div')).find(d => d.scrollHeight > d.clientHeight + 20);
-        if (scrollable) {
-          (scrollable as HTMLElement).scrollTop = 0;
-        } else {
-          window.scrollTo(0, 0);
-        }
-      });
-
-      await this.page.waitForLoadState('networkidle');
-      await this.page.waitForTimeout(1200); // debounce 1000–1500ms
-
-      cycle++;
-    }
-
-    this.page.off('response', responseHandler);
-
-    this.log("Extracting message content...");
+  async hydrateChatsMetadata(urls: string[], options?: { limit?: number; signal?: () => boolean }): Promise<Partial<CharacterSummary>[]> {
+    if (!this.page) throw new Error('Browser not launched');
+    const results: Partial<CharacterSummary>[] = [];
+    const limit = options?.limit || 10;
     
-    const extraction = await this.page.evaluate(() => {
-      const containerCandidates = [
-        { name: 'main-role-log', selector: 'main [role="log"]', priority: 3 },
-        { name: 'main-role-feed', selector: 'main [role="feed"]', priority: 3 },
-        { name: 'main-aria-message', selector: 'main [aria-label*="message" i]', priority: 2 },
-        { name: 'main', selector: 'main', priority: 1 },
-      ];
-
-      const messageSelectors = [
-        { name: 'article', selector: 'article' },
-        { name: 'role-article', selector: '[role="article"]' },
-        { name: 'role-listitem', selector: '[role="listitem"]' },
-        { name: 'div-has-more', selector: 'div:has(button[aria-label*="more" i])' },
-      ];
-
-      const cleanText = (text: string) => {
-        const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-        const junk = /^(Copy|Report|Share|Like|Reply|Menu|More)$/i;
-        const kept = lines.filter(l => !junk.test(l) && l.length > 1);
-        return kept.join('\n').trim();
-      };
-
-      const inferRole = (el: Element): 'user' | 'char' => {
-        const dataset = (el as HTMLElement).dataset;
-        if (dataset['isUser'] === 'true' || dataset['author'] === 'user') return 'user';
-        const text = el.textContent || '';
-        if (/\bYou\b/i.test(text)) return 'user';
-        const style = window.getComputedStyle(el as HTMLElement);
-        if (style.textAlign === 'right') return 'user';
-        if (style.justifyContent?.includes('flex-end')) return 'user';
-        return 'char';
-      };
-
-      const containerResults = containerCandidates.map(c => {
-        const root = document.querySelector(c.selector);
-        const messageCounts = messageSelectors.map(ms => {
-          const nodes = root ? Array.from(root.querySelectorAll(ms.selector)) : [];
-          const sampleTexts = nodes.slice(0, 2).map(n => cleanText((n as HTMLElement).innerText)).filter(Boolean);
-          return { selector: ms.selector, name: ms.name, count: nodes.length, sampleTexts };
-        });
-        const total = messageCounts.reduce((sum, m) => sum + m.count, 0);
-        return { container: c.selector, containerName: c.name, priority: c.priority, total, messageCounts, outerHTML: root?.outerHTML || '' };
-      });
-
-      const bestContainer = containerResults
-        .filter(r => r.total > 0)
-        .sort((a, b) => b.priority - a.priority || b.total - a.total)[0] || containerResults[0];
-
-      const chosenContainerSelector = bestContainer?.container || null;
-      const root = chosenContainerSelector ? document.querySelector(chosenContainerSelector) : document;
-
-      const bestMessageSelector = (bestContainer?.messageCounts || [])
-        .slice()
-        .sort((a, b) => b.count - a.count)[0];
-
-      const chosenMessageSelector = bestMessageSelector?.selector || messageSelectors[0].selector;
-      const nodes = Array.from(root ? root.querySelectorAll(chosenMessageSelector) : []);
-
-      const messages = nodes.map((el, idx) => {
-        const textRaw = (el as HTMLElement).innerText;
-        const text = cleanText(textRaw);
-        return {
-          turn_index: idx,
-          role: inferRole(el),
-          text,
-          html: (el as HTMLElement).innerHTML,
-          top: (el as HTMLElement).getBoundingClientRect().top,
-        };
-      }).filter(m => m.text && m.text.trim().length > 1);
-
-      // Deduplicate consecutive duplicates (virtualized reuse)
-      const deduped: typeof messages = [];
-      for (const msg of messages) {
-        const last = deduped[deduped.length - 1];
-        if (last && last.text === msg.text && last.role === msg.role) continue;
-        deduped.push(msg);
-      }
-
-      // Order heuristic: if top coordinate decreases (newest-first), reverse
-      let ordered = deduped;
-      if (deduped.length >= 2) {
-        const firstTop = deduped[0].top;
-        const lastTop = deduped[deduped.length - 1].top;
-        if (lastTop < firstTop) {
-          ordered = [...deduped].reverse();
-        }
-      }
-
-      const containerSnippet = (bestContainer?.outerHTML || '').slice(0, 500);
-
-      return {
-        chosenContainer: chosenContainerSelector,
-        chosenMessageSelector,
-        containerResults,
-        messages: ordered.map((m, i) => ({
-          turn_index: i,
-          role: m.role,
-          text: m.text,
-          html: m.html,
-        })),
-        containerSnippet,
-      };
-    });
-
-    let messages = extraction.messages as ScrapedMessage[];
-    if (options?.reverseTranscript) {
-      messages = [...messages].reverse().map((m, idx) => ({ ...m, turn_index: idx }));
+    for (let i = 0; i < Math.min(urls.length, limit); i++) {
+        if (options?.signal?.()) break;
+        try {
+            await this.page.goto(urls[i], { waitUntil: 'domcontentloaded', timeout: 10000 });
+            const title = await this.page.title();
+            results.push({ displayName: title.replace(' | Character.AI', '') });
+        } catch {}
     }
-
-    if (messages.length === 0) {
-      this.log(`Extracted 0 messages. Container snippet: ${extraction.containerSnippet}`);
-      this.log(`Selector counts: ${JSON.stringify(extraction.containerResults?.map((r: any) => ({ container: r.containerName, total: r.total, counts: r.messageCounts.map((m: any) => ({ name: m.name, count: m.count })) })), null, 2)}`);
-    } else {
-      this.log(`Extracted ${messages.length} messages.`);
-    }
-    return messages;
+    return results;
   }
 
-  async testSelectors(): Promise<any> {
+  async scrapeProfileCharacters(handle: string, sortMode: string): Promise<CharacterIndexEntry[]> { return []; }
+  
+  async scrapeFollowersList(type: 'followers' | 'following'): Promise<any[]> {
     if (!this.page) throw new Error("Browser not launched");
-    const diagnostics = await this.page.evaluate(() => {
-      const url = location.href;
-      const containerCandidates = [
-        { name: 'main-role-log', selector: 'main [role="log"]', priority: 3 },
-        { name: 'main-role-feed', selector: 'main [role="feed"]', priority: 3 },
-        { name: 'main-aria-message', selector: 'main [aria-label*="message" i]', priority: 2 },
-        { name: 'main', selector: 'main', priority: 1 },
-      ];
-      const messageSelectors = [
-        { name: 'article', selector: 'article' },
-        { name: 'role-article', selector: '[role="article"]' },
-        { name: 'role-listitem', selector: '[role="listitem"]' },
-        { name: 'div-has-more', selector: 'div:has(button[aria-label*="more" i])' },
-      ];
+    this.log(`Scraping ${type} list...`);
+    
+    // Ensure we are on profile page
+    if (!this.page.url().includes('/profile')) {
+        await this.page.goto('https://character.ai/profile', { waitUntil: 'domcontentloaded' });
+    }
 
-      const cleanText = (text: string) => {
-        const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-        const junk = /^(Copy|Report|Share|Like|Reply|Menu|More)$/i;
-        const kept = lines.filter(l => !junk.test(l) && l.length > 1);
-        return kept.join('\n').trim();
-      };
+    // Click the button
+    const success = await this.page.evaluate(async (targetType) => {
+        const buttons = Array.from(document.querySelectorAll('button'));
+        const btn = buttons.find(b => b.innerText?.toLowerCase().includes(targetType));
+        if (btn) {
+            btn.click();
+            return true;
+        }
+        return false;
+    }, type);
 
-      const results = containerCandidates.map(c => {
-        const root = document.querySelector(c.selector);
-        const messageCounts = messageSelectors.map(ms => {
-          const nodes = root ? Array.from(root.querySelectorAll(ms.selector)) : [];
-          const sampleTexts = nodes.slice(0, 2).map(n => cleanText((n as HTMLElement).innerText)).filter(Boolean);
-          return { messageSelector: ms.selector, messageName: ms.name, count: nodes.length, sampleTexts };
-        });
-        const total = messageCounts.reduce((sum, m) => sum + m.count, 0);
-        return { container: c.selector, containerName: c.name, total, priority: c.priority, messageCounts };
-      });
+    if (!success) {
+        this.log(`Could not find ${type} button.`);
+        return [];
+    }
 
-      const chosen = results.filter(r => r.total > 0).sort((a, b) => b.priority - a.priority || b.total - a.total)[0] || results[0];
+    // Wait for modal
+    try {
+        await this.page.waitForSelector('[role="dialog"]', { timeout: 5000 });
+    } catch {
+        this.log("Modal did not appear.");
+        return [];
+    }
 
-      const scrollCandidates = Array.from(document.querySelectorAll('div')).slice(0, 200).map((el, idx) => {
-        const rect = el.getBoundingClientRect();
-        const scrollable = el.scrollHeight > el.clientHeight + 20;
-        return scrollable ? { idx, height: el.scrollHeight, visibleHeight: el.clientHeight } : null;
-      }).filter(Boolean);
+    // Scrape list
+    // We need to scroll the modal to load all items.
+    // For now, we'll just scrape what's visible + a few scrolls.
+    const results = await this.page.evaluate(async () => {
+        const dialog = document.querySelector('[role="dialog"]');
+        if (!dialog) return [];
+        
+        // Find the scrollable container inside dialog
+        const scrollable = Array.from(dialog.querySelectorAll('div')).find(d => {
+            const style = window.getComputedStyle(d);
+            return style.overflowY === 'auto' || style.overflowY === 'scroll';
+        }) || dialog;
 
-      const selectedScroll = scrollCandidates.reduce<{ idx: number; height: number; visibleHeight: number } | null>((best, curr: any) => {
-        if (!curr) return best;
-        if (!best || curr.height > best.height) return curr;
-        return best;
-      }, null);
-
-      const sidebarLinks = Array.from(document.querySelectorAll('a[href*="/chat/"]')).length;
-
-      return { url, selectorResults: results, chosenContainer: chosen?.container, scrollCandidates, selectedScroll, sidebarLinks };
+        const items = new Map();
+        
+        // Scroll a few times
+        for (let i = 0; i < 5; i++) {
+            scrollable.scrollTop = scrollable.scrollHeight;
+            await new Promise(r => setTimeout(r, 500));
+            
+            const rows = Array.from(dialog.querySelectorAll('a[href*="/profile/"]'));
+            rows.forEach(row => {
+                const href = row.getAttribute('href');
+                const handle = href?.split('/').pop();
+                const img = row.querySelector('img');
+                const nameEl = row.querySelector('div.font-bold') || row.querySelector('span.font-bold'); // Heuristic
+                
+                if (handle) {
+                    items.set(handle, {
+                        handle: '@' + handle,
+                        avatarUrl: img?.getAttribute('src'),
+                        displayName: (nameEl as HTMLElement)?.innerText || handle
+                    });
+                }
+            });
+        }
+        return Array.from(items.values());
     });
 
-    this.log(`Selector test: ${JSON.stringify(diagnostics, null, 2)}`);
-    return diagnostics;
+    // Close modal
+    await this.page.keyboard.press('Escape');
+    
+    return results;
+  }
+
+  async indexProfileTab(tab: string, opts: any): Promise<any[]> { return []; }
+  async testSelectors(): Promise<any> { return { status: 'Selectors deprecated in V1.0 stable' }; }
+
+  // QA / Diagnostics
+    async runDiagnostics(): Promise<QAReport> {
+      this.log("[QA] Starting self-diagnostics...");
+      return await this.qaEngine.run(this.buildQAContext());
+    }
+
+  // Real-time QA Action
+    async testScroll(): Promise<boolean> {
+     if (!this.page) throw new Error("Browser not launched");
+     this.log("[QA] Testing scroll mechanism...");
+
+     // Clear Modals for QA too
+     await this.page.keyboard.press('Escape');
+     await this.page.waitForTimeout(300);
+
+     const result = await this.qaEngine.runSingle('scroll', this.buildQAContext());
+     if (!result) {
+       this.log("[QA] [FAIL] Scroll test did not run.");
+       return false;
+     }
+
+     if (result.status === 'pass') {
+       this.log("[QA] [PASS] Scrollable container found and manipulated.");
+       return true;
+     }
+
+     this.log(`[QA] [FAIL] ${result.message}`);
+     return false;
+    }
+
+  async init() {
+    return this.launch();
   }
 }

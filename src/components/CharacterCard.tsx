@@ -1,16 +1,7 @@
-import React from 'react';
-import { Download, BarChart2, Clock, UserCircle2 } from 'lucide-react';
 
-export interface CharacterCardData {
-  id: string;
-  name: string;
-  creator?: string;
-  creatorAvatarUrl?: string | null;
-  interactions?: number;
-  lastChat?: string;
-  avatarUrl?: string;
-  url?: string;
-}
+import React from 'react';
+import { Download, MessageSquare, User, BarChart2, Clock } from 'lucide-react';
+import { CharacterCardData } from '../../types';
 
 interface CharacterCardProps {
   data: CharacterCardData;
@@ -19,74 +10,89 @@ interface CharacterCardProps {
 }
 
 const CharacterCard: React.FC<CharacterCardProps> = ({ data, onExport, onView }) => {
-  const initials = data.name
-    .split(' ')
-    .map((w) => w[0])
-    .slice(0, 2)
-    .join('')
-    .toUpperCase();
-
-  const avatar = data.avatarUrl ? (
-    <img src={data.avatarUrl} alt={data.name} className="w-12 h-12 rounded-full object-cover" />
-  ) : (
-    <div className="w-12 h-12 rounded-full bg-gradient-to-br from-amber-500 to-orange-600 text-white font-semibold flex items-center justify-center">
-      {initials || 'CA'}
-    </div>
-  );
-
-  const creatorAvatar = data.creatorAvatarUrl ? (
-    <img src={data.creatorAvatarUrl} alt={data.creator || 'Creator'} className="w-5 h-5 rounded-full object-cover border border-gray-800" />
-  ) : (
-    <div className="w-5 h-5 rounded-full bg-gray-800 text-[10px] text-gray-300 flex items-center justify-center border border-gray-700">
-      {(data.creator || '??').slice(0, 2).toUpperCase()}
-    </div>
-  );
-
   return (
-    <div className="bg-gray-900 border border-gray-800 rounded-2xl p-4 flex flex-col gap-4 hover:border-amber-500/40 transition-colors">
-      <div className="flex items-center gap-3">
-        {avatar}
-        <div className="flex-1 min-w-0">
-          <div className="text-gray-100 font-semibold truncate">{data.name}</div>
-          <div className="text-xs text-gray-500 truncate flex items-center gap-2">
-            {creatorAvatar}
-            <span className="flex items-center gap-1">
-              <UserCircle2 size={14} /> {data.creator || 'Unknown creator'}
-            </span>
-          </div>
+    <div 
+        className="group relative bg-[#18181b] border border-white/5 rounded-xl overflow-hidden hover:border-white/20 transition-all duration-300 hover:shadow-2xl hover:shadow-black/50 hover:-translate-y-1 flex flex-col h-[280px]"
+        onClick={() => onView?.(data)}
+    >
+      {/* Image Area - Netflix Style */}
+      <div className="relative h-32 w-full bg-zinc-800">
+        {/* Banner Image Wrapper with Overflow Hidden */}
+        <div className="w-full h-full overflow-hidden relative">
+            {data.avatarUrl ? (
+                <>
+                    <img src={data.avatarUrl} alt={data.name} className="w-full h-full object-cover opacity-80 group-hover:opacity-100 group-hover:scale-105 transition-all duration-500" />
+                    <div className="absolute inset-0 bg-gradient-to-t from-[#18181b] to-transparent opacity-90"></div>
+                </>
+            ) : (
+                <div className="w-full h-full bg-gradient-to-br from-zinc-700 to-zinc-800 flex items-center justify-center">
+                    <span className="text-4xl font-bold text-white/10">{data.name.charAt(0)}</span>
+                </div>
+            )}
         </div>
-        <button
-          onClick={() => onView?.(data)}
-          className="text-xs px-3 py-1.5 rounded-full border border-gray-700 text-gray-200 hover:border-amber-500 hover:text-amber-200"
-        >
-          View
-        </button>
+        
+        {/* Floating Avatar - Positioned relative to the Image Area container but visually overlapping */}
+        <div className="absolute -bottom-6 left-4 z-10">
+            {data.avatarUrl ? (
+                <img src={data.avatarUrl} className="w-12 h-12 rounded-full border-2 border-[#18181b] shadow-lg" />
+            ) : (
+                <div className="w-12 h-12 rounded-full bg-zinc-700 border-2 border-[#18181b] flex items-center justify-center text-white font-bold">
+                    {data.name.charAt(0)}
+                </div>
+            )}
+        </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-3 text-xs text-gray-400">
-        <div className="flex items-center gap-2">
-          <BarChart2 size={14} className="text-amber-400" />
-          <span>{data.interactions ?? '—'} interactions</span>
+      {/* Content Area */}
+      <div className="p-4 pt-8 flex-1 flex flex-col">
+        <h3 className="text-base font-bold text-white truncate mb-1 group-hover:text-blue-400 transition-colors" title={data.name}>
+            {data.name}
+        </h3>
+        
+        <div className="flex items-center gap-1.5 text-xs text-zinc-400 mb-3">
+            <span className="truncate max-w-[120px]">{data.creator || 'Unknown'}</span>
+            {data.interactions && (
+                <>
+                    <span className="w-1 h-1 rounded-full bg-zinc-600"></span>
+                    <span className="flex items-center gap-1"><MessageSquare size={10} /> {data.interactions}</span>
+                </>
+            )}
+            {/* Likes - Added dynamically */}
+            {(data as any).likes && (
+                <>
+                    <span className="w-1 h-1 rounded-full bg-zinc-600"></span>
+                    <span className="flex items-center gap-1">
+                        <svg viewBox="0 0 24 24" fill="none" width="10" height="10" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M7 11H4a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h3m0-9v9m0-9 4-8h.616a2 2 0 0 1 1.976 2.308L13.016 9h5.047a3 3 0 0 1 2.973 3.405l-.682 5A3 3 0 0 1 17.38 20H7"></path>
+                        </svg>
+                        {(data as any).likes}
+                    </span>
+                </>
+            )}
         </div>
-        <div className="flex items-center gap-2">
-          <Clock size={14} className="text-gray-500" />
-          <span>{data.lastChat || 'Unknown'}</span>
-        </div>
-      </div>
 
-      <div className="flex gap-2">
-        <button
-          onClick={() => onExport?.(data)}
-          className="flex-1 inline-flex items-center justify-center gap-2 px-3 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-sm font-semibold"
-        >
-          <Download size={16} /> Export
-        </button>
-        <button
-          className="inline-flex items-center justify-center gap-2 px-3 py-2 rounded-lg border border-gray-800 text-gray-500 text-sm font-semibold cursor-not-allowed"
-          disabled
-        >
-          <BarChart2 size={16} /> Analyze
-        </button>
+        {/* Last Chat Timestamp (Mock/Placeholder if missing) */}
+        <div className="flex items-center gap-1.5 text-[10px] text-zinc-500 mb-4">
+            <Clock size={10} />
+            <span>Last chat: Recently</span>
+        </div>
+
+        {/* Actions */}
+        <div className="mt-auto grid grid-cols-2 gap-2 opacity-0 group-hover:opacity-100 transition-opacity duration-200 translate-y-2 group-hover:translate-y-0">
+            <button
+                onClick={(e) => { e.stopPropagation(); onExport?.(data); }}
+                className="flex items-center justify-center gap-2 py-1.5 rounded-md bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium shadow-lg shadow-blue-900/20"
+            >
+                <Download size={12} /> Export
+            </button>
+            <button
+                onClick={(e) => { e.stopPropagation(); }}
+                disabled
+                className="flex items-center justify-center gap-2 py-1.5 rounded-md bg-zinc-800 text-zinc-500 text-xs font-medium cursor-not-allowed border border-white/5"
+            >
+                <BarChart2 size={12} /> Analyze
+            </button>
+        </div>
       </div>
     </div>
   );
