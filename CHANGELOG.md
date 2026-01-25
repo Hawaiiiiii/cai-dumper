@@ -1,15 +1,13 @@
 # Changelog
 
 ## 1.0.0-overhaul (unreleased)
-- Live QA suite: continuous diagnostics, scroll test, and real-time QA reports.
-- QA overlay + force-scroll probe to identify the true chat scroller.
-- QA snapshot export to disk for AI handoff/debugging.
-- Browser launch helpers and connection checks for CDP sessions.
-- Scroll engine hardening: center-point detection, can-scroll validation, aggressive fallback.
-- DOM extraction resilience: improved selectors, deduping, and order handling.
-- IPC reliability: job queue and safer multi-call coordination.
-- UI additions: Diagnostics panel upgrades and new controls.
-- Build/dev improvements: updated notes and diagnostics output.
+- **UI/UX overhaul**: new Settings panel, Chat list, sidebar tweaks, character grid/card updates, and a cleaner app layout.
+- **Diagnostics & QA**: live QA monitor, real-time reports, scroll test, overlay highlighting, force-scroll probe, and snapshot export for AI handoff.
+- **Scroll & extraction hardening**: smarter scroller detection, can-scroll validation, more resilient selectors, dedupe, and order handling.
+- **Automation reliability**: job queue + safer IPC coordination to reduce race conditions and flaky actions.
+- **Browser control**: launch helpers, connection checks, and better diagnostics around CDP sessions.
+- **Export/metadata flow**: diagnostics output and dev notes polished for visibility.
+- **Visual spice (for science)**: snow overlay added for fun, testing, and UI flavor without breaking flow.
 
 ## 0.1.0-beta (initial release)
 - Added multi-path Python analyzer resolution and minimal analyzer output (`summary.md`).
